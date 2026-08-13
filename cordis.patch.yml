@@ -1,0 +1,7 @@
+- insert:
+    - id: weixin-channel
+      name: deepseek-harness-weixin
+      config:
+        credentialRef: WEIXIN_ILINK_CREDENTIAL
+        cwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
+        statePath: !!js process.env.DSH_WEIXIN_STATE_PATH ?? ''
