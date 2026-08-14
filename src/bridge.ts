@@ -7,7 +7,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { parseApprovalCommand } from './approvals.js'
 import type { Config } from './config.js'
 import { ConversationManager, type ConversationReply } from './conversations.js'
-import { loginWithQr } from './login.js'
+import { displayQr, loginWithQr } from './login.js'
 import { filterMarkdownForWeixin } from './markdown-filter.js'
 import { WeixinApiClient, type WeixinApiPort } from './protocol.js'
 import { SyncCursorStore } from './state.js'
@@ -32,6 +32,27 @@ export type WeixinApiFactory = (credential: WeixinCredential, config: Config) =>
 /** Injectable QR login operation. */
 export type WeixinLogin = typeof loginWithQr
 
+/** Injectable QR renderer used by terminal login and tests. */
+export type WeixinQrDisplay = (url: string) => Promise<void>
+
+/** Outcome of an explicit login request from a Harness command surface. */
+export type WeixinLoginRequest =
+  | { kind: 'connected' }
+  | { kind: 'qr-shown'; reused: boolean; url: string }
+
+type ConnectionReadiness =
+  | { kind: 'connected' }
+  | { kind: 'qr'; url: string }
+  | { kind: 'failed'; error: unknown }
+
+interface ConnectionAttempt {
+  readonly forceQr: boolean
+  readonly ready: Promise<ConnectionReadiness>
+  readonly resolveReady: (readiness: ConnectionReadiness) => void
+  task: Promise<void>
+  qrUrl?: string
+}
+
 /** Live Weixin iLink long-poll ↔ DeepSeek Harness bridge. */
 export class WeixinHarnessBridge {
   private readonly log
@@ -42,6 +63,8 @@ export class WeixinHarnessBridge {
   private api: WeixinApiPort | undefined
   private conversations: ConversationManager | undefined
   private monitorTask: Promise<void> | undefined
+  private connectionAttempt: ConnectionAttempt | undefined
+  private connected = false
   private stopping = false
 
   constructor(
@@ -50,6 +73,7 @@ export class WeixinHarnessBridge {
     private readonly apiFactory: WeixinApiFactory = (credential, resolvedConfig) =>
       new WeixinApiClient(credential.baseUrl, credential.token, resolvedConfig),
     private readonly login: WeixinLogin = loginWithQr,
+    private readonly showQr: WeixinQrDisplay = displayQr,
   ) {
     if (!isAbsolute(config.cwd)) throw new Error(`weixin-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`)
     if (config.statePath && !isAbsolute(config.statePath)) {
@@ -64,18 +88,42 @@ export class WeixinHarnessBridge {
 
   /** Resolve or create a QR credential, verify it, and begin long-polling. */
   async start(): Promise<void> {
-    const credential = await this.resolveCredential()
-    this.credential = credential
-    const api = this.apiFactory(credential, this.config)
-    this.api = api
-    const conversations = new ConversationManager(this.ctx, this.config, credential.accountId)
-    this.conversations = conversations
-    await conversations.initialize()
-    await api.notifyStart()
-    this.log.info('Weixin iLink credential verified for account %s', shortId(credential.accountId))
-    this.monitorTask = this.monitor(api, credential).catch(error => {
-      if (!this.stopping) this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
-    })
+    if (this.connected) return
+    await this.launchConnection(false).task
+  }
+
+  /** Begin connecting without making the containing Harness profile await QR login. */
+  startInBackground(): void {
+    if (this.connected || this.stopping) return
+    this.launchConnection(false)
+  }
+
+  /** Start QR login on demand, or reprint the newest QR for an active attempt. */
+  async requestLogin(signal?: AbortSignal): Promise<WeixinLoginRequest> {
+    throwIfAborted(signal)
+    if (this.stopping) throw new Error('微信通道正在停止，无法发起扫码')
+    if (this.connected) return { kind: 'connected' }
+
+    let attempt = this.connectionAttempt
+    if (attempt?.qrUrl !== undefined) {
+      await this.showQr(attempt.qrUrl)
+      return { kind: 'qr-shown', reused: true, url: attempt.qrUrl }
+    }
+
+    if (attempt === undefined) attempt = this.launchConnection(true)
+    let readiness = await waitFor(attempt.ready, signal)
+    if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
+    if (readiness.kind === 'connected') return { kind: 'connected' }
+
+    // A normal background attempt can fail on a stale stored credential before
+    // reaching QR login. One explicit command then gets a fresh QR immediately.
+    if (!attempt.forceQr && !this.stopping) {
+      attempt = this.launchConnection(true)
+      readiness = await waitFor(attempt.ready, signal)
+      if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
+      if (readiness.kind === 'connected') return { kind: 'connected' }
+    }
+    throw readiness.error
   }
 
   /** Abort long-polling and await all owned messages and agents. */
@@ -84,6 +132,8 @@ export class WeixinHarnessBridge {
     this.stopping = true
     this.abortController.abort()
     this.conversations?.cancelPendingApprovals()
+    const connectionTask = this.connectionAttempt?.task
+    if (connectionTask !== undefined) await Promise.allSettled([connectionTask])
     if (this.monitorTask !== undefined) await this.monitorTask
     await Promise.allSettled(this.inFlight)
     if (this.conversations !== undefined) await this.conversations.dispose()
@@ -94,21 +144,98 @@ export class WeixinHarnessBridge {
         this.log.warn('Weixin notifyStop failed during teardown: %s', String(error))
       }
     }
+    this.connected = false
   }
 
-  private async resolveCredential(): Promise<WeixinCredential> {
+  private launchConnection(forceQr: boolean): ConnectionAttempt {
+    if (this.stopping) throw new Error('微信通道正在停止，无法建立连接')
+    if (this.connectionAttempt !== undefined) return this.connectionAttempt
+
+    let resolveReady!: (readiness: ConnectionReadiness) => void
+    const ready = new Promise<ConnectionReadiness>(resolve => { resolveReady = resolve })
+    const attempt: ConnectionAttempt = {
+      forceQr,
+      ready,
+      resolveReady,
+      task: Promise.resolve(),
+    }
+    attempt.task = this.connect(forceQr, attempt)
+    this.connectionAttempt = attempt
+    void attempt.task.then(
+      () => {
+        attempt.resolveReady({ kind: 'connected' })
+        if (this.connectionAttempt === attempt) this.connectionAttempt = undefined
+      },
+      error => {
+        attempt.resolveReady({ kind: 'failed', error })
+        if (this.connectionAttempt === attempt) this.connectionAttempt = undefined
+        if (!this.stopping) {
+          this.log.warn(
+            'Weixin channel remains offline: %s. Harness Web is unaffected; run /weixin-login to show a fresh QR code.',
+            String(error),
+          )
+        }
+      },
+    )
+    return attempt
+  }
+
+  private async connect(forceQr: boolean, attempt: ConnectionAttempt): Promise<void> {
+    const credential = await this.resolveCredential(forceQr, attempt)
+    throwIfAborted(this.abortController.signal)
+    const api = this.apiFactory(credential, this.config)
+    const conversations = new ConversationManager(this.ctx, this.config, credential.accountId)
+    let notified = false
+    try {
+      await conversations.initialize()
+      throwIfAborted(this.abortController.signal)
+      await api.notifyStart()
+      notified = true
+      throwIfAborted(this.abortController.signal)
+    } catch (error) {
+      await Promise.allSettled([
+        conversations.dispose(),
+        ...(notified ? [api.notifyStop()] : []),
+      ])
+      throw error
+    }
+
+    this.credential = credential
+    this.api = api
+    this.conversations = conversations
+    this.connected = true
+    this.log.info('Weixin iLink credential verified for account %s', shortId(credential.accountId))
+    this.monitorTask = this.monitor(api, credential).catch(error => {
+      if (!this.stopping) this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
+    })
+  }
+
+  private async resolveCredential(forceQr: boolean, attempt: ConnectionAttempt): Promise<WeixinCredential> {
     const ref = credentialRef(this.config.credentialRef)
-    const resolved = await this.ctx.credentials.resolve(ref)
-    if (resolved !== undefined) return parseCredential(resolved.value)
-    if (!this.config.autoLogin) {
+    if (!forceQr) {
+      const resolved = await this.ctx.credentials.resolve(ref)
+      if (resolved !== undefined) return parseCredential(resolved.value)
+    }
+    if (!forceQr && !this.config.autoLogin) {
       throw new Error(`weixin-channel: credential ${JSON.stringify(this.config.credentialRef)} is not configured`)
     }
 
-    this.log.info('No Weixin credential found; starting official QR login')
+    this.log.info(forceQr
+      ? 'Starting explicitly requested Weixin QR login'
+      : 'No Weixin credential found; starting official QR login')
     const credential = await this.login({
       timeoutMs: this.config.loginTimeoutMs,
-      callbacks: { status: message => this.log.info('%s', message) },
+      signal: this.abortController.signal,
+      callbacks: {
+        showQr: async url => {
+          attempt.qrUrl = url
+          await this.showQr(url)
+          attempt.resolveReady({ kind: 'qr', url })
+        },
+        status: message => this.log.info('%s', message),
+      },
     })
+    throwIfAborted(this.abortController.signal)
     await this.ctx.credentials.set(ref, JSON.stringify(credential))
     this.log.info('Weixin credential stored by the Harness credential provider')
     return credential
@@ -391,4 +518,36 @@ function resolveStatePath(configured: string, accountId: string): string {
 
 function shortId(value: string): string {
   return value.length <= 12 ? value : value.slice(0, 12)
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new Error(typeof signal.reason === 'string' ? signal.reason : '操作已取消')
+}
+
+function waitFor<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return promise
+  throwIfAborted(signal)
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => {
+      signal.removeEventListener('abort', abort)
+      try {
+        throwIfAborted(signal)
+      } catch (error) {
+        reject(error)
+      }
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    void promise.then(
+      value => {
+        signal.removeEventListener('abort', abort)
+        resolve(value)
+      },
+      error => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      },
+    )
+  })
 }

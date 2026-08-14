@@ -181,6 +181,122 @@ describe('WeixinHarnessBridge', () => {
     await bridge.stop()
   })
 
+  it('starts QR login in the background without waiting for authorization', async () => {
+    const ctx = commandContext(undefined)
+    const login = vi.fn((options: { signal?: AbortSignal }) => new Promise<WeixinCredential>((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(new Error('login stopped')), { once: true })
+    }))
+    const bridge = new WeixinHarnessBridge(
+      ctx,
+      testConfig({ autoLogin: true }),
+      () => new FakeApi(),
+      login as never,
+      vi.fn(async () => undefined),
+    )
+
+    expect(bridge.startInBackground()).toBeUndefined()
+    await vi.waitFor(() => expect(login).toHaveBeenCalledOnce())
+    await bridge.stop()
+  })
+
+  it('starts a fresh QR attempt on explicit request after background login is unavailable', async () => {
+    const api = new FakeApi()
+    const ctx = commandContext(undefined)
+    const showQr = vi.fn(async () => undefined)
+    const login = vi.fn(async (options: {
+      callbacks?: { showQr?: (url: string) => Promise<void> }
+    }) => {
+      await options.callbacks?.showQr?.('https://qr.example/fresh')
+      return CREDENTIAL
+    })
+    const bridge = new WeixinHarnessBridge(
+      ctx,
+      testConfig({ autoLogin: false }),
+      () => api,
+      login as never,
+      showQr,
+    )
+
+    bridge.startInBackground()
+    await vi.waitFor(() => {
+      expect((ctx as { credentials: { resolve: ReturnType<typeof vi.fn> } }).credentials.resolve).toHaveBeenCalled()
+    })
+    const result = await bridge.requestLogin()
+
+    expect(result).toEqual({ kind: 'qr-shown', reused: false, url: 'https://qr.example/fresh' })
+    expect(showQr).toHaveBeenCalledWith('https://qr.example/fresh')
+    expect(login).toHaveBeenCalledOnce()
+    await bridge.start()
+    expect((ctx as { credentials: { set: ReturnType<typeof vi.fn> } }).credentials.set)
+      .toHaveBeenCalledWith('WEIXIN_ILINK_CREDENTIAL', JSON.stringify(CREDENTIAL))
+    await bridge.stop()
+  })
+
+  it('starts a new QR flow after an earlier background scan attempt expires', async () => {
+    const api = new FakeApi()
+    const showQr = vi.fn(async () => undefined)
+    const login = vi.fn()
+      .mockRejectedValueOnce(new Error('微信扫码登录超时，请重新启动后再试'))
+      .mockImplementationOnce(async (options: {
+        callbacks?: { showQr?: (url: string) => Promise<void> }
+      }) => {
+        await options.callbacks?.showQr?.('https://qr.example/after-expiry')
+        return CREDENTIAL
+      })
+    const bridge = new WeixinHarnessBridge(
+      commandContext(undefined),
+      testConfig({ autoLogin: true }),
+      () => api,
+      login as never,
+      showQr,
+    )
+
+    bridge.startInBackground()
+    await vi.waitFor(() => expect(login).toHaveBeenCalledTimes(1))
+    await expect(bridge.requestLogin()).resolves.toEqual({
+      kind: 'qr-shown',
+      reused: false,
+      url: 'https://qr.example/after-expiry',
+    })
+    expect(login).toHaveBeenCalledTimes(2)
+    expect(showQr).toHaveBeenCalledWith('https://qr.example/after-expiry')
+
+    await bridge.start()
+    await bridge.stop()
+  })
+
+  it('reprints the latest QR instead of starting a second login writer', async () => {
+    let finishLogin!: (credential: WeixinCredential) => void
+    const login = vi.fn(async (options: {
+      callbacks?: { showQr?: (url: string) => Promise<void> }
+    }) => {
+      await options.callbacks?.showQr?.('https://qr.example/current')
+      return new Promise<WeixinCredential>(resolve => { finishLogin = resolve })
+    })
+    const showQr = vi.fn(async () => undefined)
+    const bridge = new WeixinHarnessBridge(
+      commandContext(undefined),
+      testConfig({ autoLogin: true }),
+      () => new FakeApi(),
+      login as never,
+      showQr,
+    )
+
+    bridge.startInBackground()
+    await vi.waitFor(() => expect(showQr).toHaveBeenCalledOnce())
+    await expect(bridge.requestLogin()).resolves.toEqual({
+      kind: 'qr-shown',
+      reused: true,
+      url: 'https://qr.example/current',
+    })
+    expect(showQr).toHaveBeenCalledTimes(2)
+    expect(login).toHaveBeenCalledOnce()
+
+    finishLogin(CREDENTIAL)
+    await bridge.start()
+    await bridge.stop()
+  })
+
   it('fails before constructing an API client when login is disabled and no credential exists', async () => {
     const factory = vi.fn()
     const bridge = new WeixinHarnessBridge(commandContext(undefined), testConfig(), factory as never)

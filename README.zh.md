@@ -19,6 +19,7 @@
 - 当前模型不支持视觉时，自动保存图片并降级为附件说明。
 - 支持允许名单、禁用策略、有界并发、去重、重试和完整清理。
 - 内置 `/bot-ping`、`/bot-help`、`/bot-status`、`/bot-image-test`、`/bot-cancel`。
+- 按需扫码不阻塞 Harness Web；可从 Linux 终端主动生成或重显二维码。
 - 工具请求审批时，可在同一微信会话用 `/approve <短码>` 或 `/reject <短码>` 决定。
 - `/new`、`/reset` 创建新的持久 session；其他 Harness 斜杠命令直接进入命令运行时。
 
@@ -48,7 +49,15 @@ pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
 pnpm dsh web
 ```
 
-首次启动时，插件会在终端显示二维码和一个短期有效的备用链接。用手机微信扫码并确认连接。如果微信显示数字验证码，在同一个终端输入该数字。服务器签发的凭据会通过 `ctx.credentials` 保存到 `WEIXIN_ILINK_CREDENTIAL`；后续启动不需要再次扫码。
+启动 `pnpm dsh web` 时，插件只会恢复已有凭据；没有凭据时保持离线，不会自动创建二维码，也不会阻塞或关闭 Harness Web。
+
+需要主动扫码或重新显示当前二维码时，另开一个 Linux 终端运行：
+
+```sh
+pnpm dsh plugin --profile web exec dsh-weixin login
+```
+
+这个命令通过仅当前用户可访问的本机 Unix Socket 联系正在运行的插件，并把新二维码或当前扫码流程的最新二维码显示在执行命令的终端。它不会重启 Web、不会等待扫码完成，也不会把备用链接写入 session。扫码流程最终超时后，再次执行即可开始全新流程。Web 中的 `/weixin-login` 也保留为辅助入口，但不是使用命令行扫码的前提。
 
 不要转发二维码备用链接，也不要复制或提交保存后的 JSON 凭据；两者都能授权访问已连接的 ClawBot。
 
@@ -62,7 +71,9 @@ pnpm dsh web
   config:
     credentialRef: WEIXIN_ILINK_CREDENTIAL
     cwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
+    permissionPreset: workspace-write
     statePath: !!js process.env.DSH_WEIXIN_STATE_PATH ?? ''
+    controlSocketPath: !!js process.env.DSH_WEIXIN_CONTROL_SOCKET ?? ''
 ```
 
 如需调整，在 `~/.dsh/profiles/web/cordis.patch.yml` 覆盖这一行：
@@ -76,6 +87,8 @@ pnpm dsh web
     agentPreset: standard
     permissionPreset: workspace-write
     statePath: /absolute/path/weixin-sync.json
+    controlSocketPath: /absolute/path/weixin-control.sock
+    autoLogin: false
     accessPolicy: allowlist
     allowFrom: [your-ilink-user-id]
     imageInputMode: auto
@@ -86,6 +99,10 @@ pnpm dsh web
 ```
 
 `statePath` 为空时，游标默认保存在 `~/.dsh/weixin/`，并以原子写入和 `0600` 文件权限保护。
+
+`controlSocketPath` 为空时默认为 `~/.dsh/weixin/control.sock`，目录权限为 `0700`，Socket 权限为 `0600`。如自定义路径，CLI 使用相同的 `DSH_WEIXIN_CONTROL_SOCKET` 环境变量，或传入 `dsh-weixin login --socket <path>`。
+
+`autoLogin` 默认为 `false`：缺少凭据时保持离线，只有运行上面的 Linux 命令才发起扫码。设为 `true` 可恢复启动 Web 时在后台自动显示二维码的行为；无论取值如何，扫码都不会阻塞 Web。
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
 
@@ -111,7 +128,7 @@ session ID namespace 已升级为 `weixin-v3-single-...`。已有 `weixin-v1-sin
 
 `/new` 和 `/reset` 由微信通道处理：如当前 Agent 正在运行，会先取消并等待其闭合，然后创建新的持久 Harness session。旧 session 不会删除，仍可在 Web 中恢复或查看。
 
-其他语法合法的斜杠命令会调用 `ctx.commands.execute(agent, line, signal)`，而不是作为用户文字交给模型；因此会产生 Harness 原生的 `command/run` 和 `command/done` 事件。实际命令目录取决于当前 Harness 组合，通常包括 `/plan`、`/compact`、`/permission`、`/goal`、`/feedback` 和 `/export`。未知或格式错误的斜杠命令会直接返回命令提示，同样不会进入模型。
+`/weixin-login` 是 Linux CLI 之外的辅助入口，可在微信尚未连接时从 Web 主动拉起扫码；它不会进入模型。其他语法合法的斜杠命令会调用 `ctx.commands.execute(agent, line, signal)`，而不是作为用户文字交给模型；因此会产生 Harness 原生的 `command/run` 和 `command/done` 事件。实际命令目录取决于当前 Harness 组合，通常包括 `/plan`、`/compact`、`/permission`、`/goal`、`/feedback` 和 `/export`。未知或格式错误的斜杠命令会直接返回命令提示，同样不会进入模型。
 
 ## Markdown 兼容性
 

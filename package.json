@@ -1,10 +1,13 @@
 {
   "name": "deepseek-harness-weixin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Official Weixin iLink QR-login text and image bridge for DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "dsh-weixin": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -24,7 +27,7 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean --sourcemap",
+    "build": "tsup src/index.ts src/cli.ts --format esm --dts --clean --sourcemap",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "pnpm run typecheck && pnpm run test && pnpm run build",

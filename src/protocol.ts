@@ -13,8 +13,8 @@ import {
 } from './types.js'
 import { generateClientId } from './util.js'
 
-const CHANNEL_VERSION = '0.2.0'
-const BOT_AGENT = 'DeepSeek-Harness/0.2.0'
+const CHANNEL_VERSION = '0.2.1'
+const BOT_AGENT = 'DeepSeek-Harness/0.2.1'
 const ILINK_APP_ID = 'bot'
 // Protocol compatibility level of Tencent/openclaw-weixin v2.4.6.
 const ILINK_APP_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6
@@ -204,6 +204,7 @@ export function requestQrJson(
   timeoutMs: number,
   body?: unknown,
   fetchImpl: FetchPort = fetch,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   return requestJson(fetchImpl, {
     url,
@@ -212,6 +213,7 @@ export function requestQrJson(
     ...(body === undefined ? {} : { body }),
     timeoutMs,
     label: 'Weixin QR login',
+    ...(signal === undefined ? {} : { signal }),
   })
 }
 

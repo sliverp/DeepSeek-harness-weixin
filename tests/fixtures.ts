@@ -6,6 +6,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     credentialRef: 'WEIXIN_ILINK_CREDENTIAL',
     cwd: '/tmp/weixin-test',
     statePath: '/tmp/weixin-test-sync.json',
+    controlSocketPath: '/tmp/weixin-test-control.sock',
     autoLogin: false,
     accessPolicy: 'open',
     allowFrom: [],

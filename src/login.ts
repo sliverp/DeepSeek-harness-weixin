@@ -35,7 +35,7 @@ interface StatusResponse {
 /** QR-login callbacks kept injectable for deterministic protocol tests. */
 export interface LoginCallbacks {
   showQr(url: string): Promise<void>
-  readVerifyCode(prompt: string): Promise<string>
+  readVerifyCode(prompt: string, signal?: AbortSignal): Promise<string>
   status(message: string): void
 }
 
@@ -45,6 +45,7 @@ export async function loginWithQr(options: {
   existingTokens?: string[]
   callbacks?: Partial<LoginCallbacks>
   fetchImpl?: typeof fetch
+  signal?: AbortSignal
 }): Promise<WeixinCredential> {
   const callbacks: LoginCallbacks = {
     showQr: options.callbacks?.showQr ?? displayQr,
@@ -58,11 +59,13 @@ export async function loginWithQr(options: {
   let pendingVerifyCode: string | undefined
   let scanned = false
 
-  let qr = await fetchQr(options.existingTokens ?? [], fetchImpl)
+  throwIfAborted(options.signal)
+  let qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal)
   await callbacks.showQr(qr.url)
   callbacks.status('请用手机微信扫描二维码，并在微信中确认连接。')
 
   while (Date.now() < deadline) {
+    throwIfAborted(options.signal)
     const remaining = deadline - Date.now()
     let response: StatusResponse
     try {
@@ -72,14 +75,16 @@ export async function loginWithQr(options: {
         pendingVerifyCode,
         Math.min(QR_POLL_TIMEOUT_MS, remaining),
         fetchImpl,
+        options.signal,
       )
     } catch (error) {
+      throwIfAborted(options.signal)
       if (isAbort(error)) {
-        await delay(250)
+        await delay(250, options.signal)
         continue
       }
       callbacks.status(`二维码状态查询暂时失败，正在重试：${String(error)}`)
-      await delay(1_000)
+      await delay(1_000, options.signal)
       continue
     }
 
@@ -98,6 +103,7 @@ export async function loginWithQr(options: {
           pendingVerifyCode === undefined
             ? '请输入手机微信显示的数字：'
             : '数字不匹配，请重新输入：',
+          options.signal,
         )
         continue
       case 'scaned_but_redirect':
@@ -112,7 +118,7 @@ export async function loginWithQr(options: {
         }
         pendingVerifyCode = undefined
         scanned = false
-        qr = await fetchQr(options.existingTokens ?? [], fetchImpl)
+        qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal)
         callbacks.status('二维码已刷新，请重新扫描。')
         await callbacks.showQr(qr.url)
         break
@@ -134,18 +140,24 @@ export async function loginWithQr(options: {
       default:
         throw new Error(`微信二维码服务器返回未知状态：${String(response.status)}`)
     }
-    await delay(1_000)
+    await delay(1_000, options.signal)
   }
+  throwIfAborted(options.signal)
   throw new Error('微信扫码登录超时，请重新启动后再试')
 }
 
-async function fetchQr(existingTokens: string[], fetchImpl: typeof fetch): Promise<{ id: string; url: string }> {
+async function fetchQr(
+  existingTokens: string[],
+  fetchImpl: typeof fetch,
+  signal?: AbortSignal,
+): Promise<{ id: string; url: string }> {
   const response = await requestQrJson(
     'POST',
     `${FIXED_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`,
     15_000,
     { local_token_list: existingTokens.slice(-10).reverse() },
     fetchImpl,
+    signal,
   ) as QrResponse
   const id = response.qrcode?.trim()
   const url = response.qrcode_img_content?.trim()
@@ -159,6 +171,7 @@ function pollStatus(
   verifyCode: string | undefined,
   timeoutMs: number,
   fetchImpl: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<StatusResponse> {
   const query = new URLSearchParams({ qrcode })
   if (verifyCode) query.set('verify_code', verifyCode)
@@ -168,6 +181,7 @@ function pollStatus(
     timeoutMs,
     undefined,
     fetchImpl,
+    signal,
   ) as Promise<StatusResponse>
 }
 
@@ -182,10 +196,12 @@ export async function displayQr(url: string): Promise<void> {
   process.stdout.write(`二维码备用链接（请勿转发）：\n${url}\n`)
 }
 
-async function readVerifyCode(prompt: string): Promise<string> {
+async function readVerifyCode(prompt: string, signal?: AbortSignal): Promise<string> {
   const input = createInterface({ input: process.stdin, output: process.stdout })
   try {
-    return (await input.question(prompt)).trim()
+    return (await (signal === undefined
+      ? input.question(prompt)
+      : input.question(prompt, { signal }))).trim()
   } finally {
     input.close()
   }
@@ -205,4 +221,10 @@ function normalizeBaseUrl(value: string): string {
 
 function isAbort(error: unknown): boolean {
   return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return
+  if (signal.reason instanceof Error) throw signal.reason
+  throw new Error(typeof signal.reason === 'string' ? signal.reason : '微信扫码登录已取消')
 }

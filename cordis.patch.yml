@@ -6,3 +6,5 @@
         cwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
         permissionPreset: workspace-write
         statePath: !!js process.env.DSH_WEIXIN_STATE_PATH ?? ''
+        controlSocketPath: !!js process.env.DSH_WEIXIN_CONTROL_SOCKET ?? ''
+        autoLogin: false

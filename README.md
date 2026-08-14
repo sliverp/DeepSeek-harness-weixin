@@ -19,6 +19,7 @@ This is a DeepSeek Harness plugin, not an OpenClaw adapter. The iLink protocol, 
 - Automatic text-only fallback when the selected model cannot inspect images.
 - Allowlist/disabled access policy, bounded concurrency, deduplication, retries, and clean teardown.
 - `/bot-ping`, `/bot-help`, `/bot-status`, `/bot-image-test`, and `/bot-cancel` diagnostics.
+- On-demand QR login that never blocks Harness Web, with an explicit Linux CLI trigger.
 - Same-chat `/approve <code>` and `/reject <code>` decisions for tool approval requests.
 - Persistent `/new` and `/reset` sessions plus direct dispatch of other Harness slash commands.
 
@@ -48,7 +49,15 @@ Installation only updates the profile. Start the service with the command below,
 pnpm dsh web
 ```
 
-On the first launch, the plugin prints a QR code and a short-lived fallback URL. Scan it with Weixin and confirm the connection. If Weixin shows a numeric verification code, type that code into the same terminal. The issued credential is then stored under `WEIXIN_ILINK_CREDENTIAL` by `ctx.credentials`; subsequent launches require no login.
+When `pnpm dsh web` starts, the plugin only restores an existing credential. Without one, the channel stays offline: it does not create a QR automatically and never blocks or stops Harness Web.
+
+To start login explicitly or show the current QR again, open another Linux shell and run:
+
+```sh
+pnpm dsh plugin --profile web exec dsh-weixin login
+```
+
+The command contacts the live plugin over an owner-only local Unix socket and displays a fresh QR, or the newest QR from an active attempt, in the shell that ran the command. It neither restarts Web nor waits for authorization, and no fallback URL is persisted in a session. Run it again after an attempt times out to begin a new attempt. Web `/weixin-login` remains available as a convenience, but is not required for CLI login.
 
 Do not share the QR fallback URL or the stored JSON credential. Both authorize access to the linked ClawBot.
 
@@ -62,7 +71,9 @@ The bundle inserts this row:
   config:
     credentialRef: WEIXIN_ILINK_CREDENTIAL
     cwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
+    permissionPreset: workspace-write
     statePath: !!js process.env.DSH_WEIXIN_STATE_PATH ?? ''
+    controlSocketPath: !!js process.env.DSH_WEIXIN_CONTROL_SOCKET ?? ''
 ```
 
 Override the row in `~/.dsh/profiles/web/cordis.patch.yml` when needed:
@@ -76,6 +87,8 @@ Override the row in `~/.dsh/profiles/web/cordis.patch.yml` when needed:
     agentPreset: standard
     permissionPreset: workspace-write
     statePath: /absolute/path/weixin-sync.json
+    controlSocketPath: /absolute/path/weixin-control.sock
+    autoLogin: false
     accessPolicy: allowlist
     allowFrom: [your-ilink-user-id]
     imageInputMode: auto
@@ -86,6 +99,10 @@ Override the row in `~/.dsh/profiles/web/cordis.patch.yml` when needed:
 ```
 
 When `statePath` is empty, the cursor is stored under `~/.dsh/weixin/`. The plugin creates the file atomically with mode `0600`.
+
+When `controlSocketPath` is empty, it defaults to `~/.dsh/weixin/control.sock`; the directory is mode `0700` and the socket is mode `0600`. For a custom path, give the CLI the same `DSH_WEIXIN_CONTROL_SOCKET` environment variable or pass `dsh-weixin login --socket <path>`.
+
+`autoLogin` defaults to `false`: without a credential, the channel stays offline until the Linux command above requests QR login. Set it to `true` to restore automatic background QR display during Web startup; neither setting allows QR login to block Web.
 
 `imageInputMode` defaults to `auto`: image-capable models receive a durable image block, while text-only models receive attachment metadata instead of failing the turn. Use `always` only with a route known to accept images, or `never` to force the fallback.
 
@@ -111,7 +128,7 @@ Session IDs now use the `weixin-v3-single-...` namespace. Existing `weixin-v1-si
 
 `/new` and `/reset` are channel-owned. If the current Agent is running, the channel cancels it and waits for the turn to close before creating a fresh persistent Harness session. The old session is retained for Web inspection or resume.
 
-Every other syntactically valid slash command is sent to `ctx.commands.execute(agent, line, signal)`, never to the model, and therefore records native `command/run` and `command/done` events. The effective catalog depends on the Harness composition and commonly includes `/plan`, `/compact`, `/permission`, `/goal`, `/feedback`, and `/export`. Unknown or malformed slash commands return command guidance without entering the model.
+`/weixin-login` is a secondary entry point alongside the Linux CLI; it can start QR login from Web while Weixin is disconnected and never enters the model. Every other syntactically valid slash command is sent to `ctx.commands.execute(agent, line, signal)`, never to the model, and therefore records native `command/run` and `command/done` events. The effective catalog depends on the Harness composition and commonly includes `/plan`, `/compact`, `/permission`, `/goal`, `/feedback`, and `/export`. Unknown or malformed slash commands return command guidance without entering the model.
 
 ## Markdown compatibility
 

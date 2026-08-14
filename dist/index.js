@@ -1,3 +1,10 @@
+import {
+  WeixinControlServer,
+  defaultControlSocketPath,
+  requestLoginFromControlSocket,
+  resolveControlSocketPath
+} from "./chunk-2OXSSMUP.js";
+
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
 import { homedir } from "os";
@@ -697,8 +704,8 @@ import { createInterface } from "readline/promises";
 
 // src/protocol.ts
 import { createCipheriv, createDecipheriv, createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
-var CHANNEL_VERSION = "0.2.0";
-var BOT_AGENT = "DeepSeek-Harness/0.2.0";
+var CHANNEL_VERSION = "0.2.1";
+var BOT_AGENT = "DeepSeek-Harness/0.2.1";
 var ILINK_APP_ID = "bot";
 var ILINK_APP_CLIENT_VERSION = 2 << 16 | 4 << 8 | 6;
 var DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -840,14 +847,15 @@ var WeixinApiClient = class {
     });
   }
 };
-function requestQrJson(method, url, timeoutMs, body, fetchImpl = fetch) {
+function requestQrJson(method, url, timeoutMs, body, fetchImpl = fetch, signal) {
   return requestJson(fetchImpl, {
     url,
     method,
     headers: commonHeaders(),
     ...body === void 0 ? {} : { body },
     timeoutMs,
-    label: "Weixin QR login"
+    label: "Weixin QR login",
+    ...signal === void 0 ? {} : { signal }
   });
 }
 function requestJson(fetchImpl, options) {
@@ -952,10 +960,12 @@ async function loginWithQr(options) {
   let refreshes = 0;
   let pendingVerifyCode;
   let scanned = false;
-  let qr = await fetchQr(options.existingTokens ?? [], fetchImpl);
+  throwIfAborted(options.signal);
+  let qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal);
   await callbacks.showQr(qr.url);
   callbacks.status("\u8BF7\u7528\u624B\u673A\u5FAE\u4FE1\u626B\u63CF\u4E8C\u7EF4\u7801\uFF0C\u5E76\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4\u8FDE\u63A5\u3002");
   while (Date.now() < deadline) {
+    throwIfAborted(options.signal);
     const remaining = deadline - Date.now();
     let response;
     try {
@@ -964,15 +974,17 @@ async function loginWithQr(options) {
         qr.id,
         pendingVerifyCode,
         Math.min(QR_POLL_TIMEOUT_MS, remaining),
-        fetchImpl
+        fetchImpl,
+        options.signal
       );
     } catch (error) {
+      throwIfAborted(options.signal);
       if (isAbort2(error)) {
-        await delay(250);
+        await delay(250, options.signal);
         continue;
       }
       callbacks.status(`\u4E8C\u7EF4\u7801\u72B6\u6001\u67E5\u8BE2\u6682\u65F6\u5931\u8D25\uFF0C\u6B63\u5728\u91CD\u8BD5\uFF1A${String(error)}`);
-      await delay(1e3);
+      await delay(1e3, options.signal);
       continue;
     }
     switch (response.status) {
@@ -987,7 +999,8 @@ async function loginWithQr(options) {
         break;
       case "need_verifycode":
         pendingVerifyCode = await callbacks.readVerifyCode(
-          pendingVerifyCode === void 0 ? "\u8BF7\u8F93\u5165\u624B\u673A\u5FAE\u4FE1\u663E\u793A\u7684\u6570\u5B57\uFF1A" : "\u6570\u5B57\u4E0D\u5339\u914D\uFF0C\u8BF7\u91CD\u65B0\u8F93\u5165\uFF1A"
+          pendingVerifyCode === void 0 ? "\u8BF7\u8F93\u5165\u624B\u673A\u5FAE\u4FE1\u663E\u793A\u7684\u6570\u5B57\uFF1A" : "\u6570\u5B57\u4E0D\u5339\u914D\uFF0C\u8BF7\u91CD\u65B0\u8F93\u5165\uFF1A",
+          options.signal
         );
         continue;
       case "scaned_but_redirect":
@@ -1002,7 +1015,7 @@ async function loginWithQr(options) {
         }
         pendingVerifyCode = void 0;
         scanned = false;
-        qr = await fetchQr(options.existingTokens ?? [], fetchImpl);
+        qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal);
         callbacks.status("\u4E8C\u7EF4\u7801\u5DF2\u5237\u65B0\uFF0C\u8BF7\u91CD\u65B0\u626B\u63CF\u3002");
         await callbacks.showQr(qr.url);
         break;
@@ -1024,24 +1037,26 @@ async function loginWithQr(options) {
       default:
         throw new Error(`\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u670D\u52A1\u5668\u8FD4\u56DE\u672A\u77E5\u72B6\u6001\uFF1A${String(response.status)}`);
     }
-    await delay(1e3);
+    await delay(1e3, options.signal);
   }
+  throwIfAborted(options.signal);
   throw new Error("\u5FAE\u4FE1\u626B\u7801\u767B\u5F55\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u540E\u518D\u8BD5");
 }
-async function fetchQr(existingTokens, fetchImpl) {
+async function fetchQr(existingTokens, fetchImpl, signal) {
   const response = await requestQrJson(
     "POST",
     `${FIXED_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`,
     15e3,
     { local_token_list: existingTokens.slice(-10).reverse() },
-    fetchImpl
+    fetchImpl,
+    signal
   );
   const id = response.qrcode?.trim();
   const url = response.qrcode_img_content?.trim();
   if (!id || !url) throw new Error("\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u670D\u52A1\u5668\u6CA1\u6709\u8FD4\u56DE\u6709\u6548\u4E8C\u7EF4\u7801");
   return { id, url };
 }
-function pollStatus(baseUrl, qrcode, verifyCode, timeoutMs, fetchImpl) {
+function pollStatus(baseUrl, qrcode, verifyCode, timeoutMs, fetchImpl, signal) {
   const query = new URLSearchParams({ qrcode });
   if (verifyCode) query.set("verify_code", verifyCode);
   return requestQrJson(
@@ -1049,7 +1064,8 @@ function pollStatus(baseUrl, qrcode, verifyCode, timeoutMs, fetchImpl) {
     `${baseUrl}/ilink/bot/get_qrcode_status?${query.toString()}`,
     timeoutMs,
     void 0,
-    fetchImpl
+    fetchImpl,
+    signal
   );
 }
 async function displayQr(url) {
@@ -1062,10 +1078,10 @@ async function displayQr(url) {
 ${url}
 `);
 }
-async function readVerifyCode(prompt) {
+async function readVerifyCode(prompt, signal) {
   const input = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return (await input.question(prompt)).trim();
+    return (await (signal === void 0 ? input.question(prompt) : input.question(prompt, { signal }))).trim();
   } finally {
     input.close();
   }
@@ -1082,6 +1098,11 @@ function normalizeBaseUrl(value) {
 }
 function isAbort2(error) {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error(typeof signal.reason === "string" ? signal.reason : "\u5FAE\u4FE1\u626B\u7801\u767B\u5F55\u5DF2\u53D6\u6D88");
 }
 
 // src/markdown-filter.ts
@@ -1453,11 +1474,12 @@ var OUTBOUND_TEST_PNG = Buffer.from(
   "base64"
 );
 var WeixinHarnessBridge = class {
-  constructor(ctx, config, apiFactory = (credential, resolvedConfig) => new WeixinApiClient(credential.baseUrl, credential.token, resolvedConfig), login = loginWithQr) {
+  constructor(ctx, config, apiFactory = (credential, resolvedConfig) => new WeixinApiClient(credential.baseUrl, credential.token, resolvedConfig), login = loginWithQr, showQr = displayQr) {
     this.ctx = ctx;
     this.config = config;
     this.apiFactory = apiFactory;
     this.login = login;
+    this.showQr = showQr;
     if (!isAbsolute(config.cwd)) throw new Error(`weixin-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`);
     if (config.statePath && !isAbsolute(config.statePath)) {
       throw new Error(`weixin-channel: statePath must be absolute, got ${JSON.stringify(config.statePath)}`);
@@ -1472,6 +1494,7 @@ var WeixinHarnessBridge = class {
   config;
   apiFactory;
   login;
+  showQr;
   log;
   seen;
   abortController = new AbortController();
@@ -1480,21 +1503,40 @@ var WeixinHarnessBridge = class {
   api;
   conversations;
   monitorTask;
+  connectionAttempt;
+  connected = false;
   stopping = false;
   /** Resolve or create a QR credential, verify it, and begin long-polling. */
   async start() {
-    const credential = await this.resolveCredential();
-    this.credential = credential;
-    const api = this.apiFactory(credential, this.config);
-    this.api = api;
-    const conversations = new ConversationManager(this.ctx, this.config, credential.accountId);
-    this.conversations = conversations;
-    await conversations.initialize();
-    await api.notifyStart();
-    this.log.info("Weixin iLink credential verified for account %s", shortId2(credential.accountId));
-    this.monitorTask = this.monitor(api, credential).catch((error) => {
-      if (!this.stopping) this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
-    });
+    if (this.connected) return;
+    await this.launchConnection(false).task;
+  }
+  /** Begin connecting without making the containing Harness profile await QR login. */
+  startInBackground() {
+    if (this.connected || this.stopping) return;
+    this.launchConnection(false);
+  }
+  /** Start QR login on demand, or reprint the newest QR for an active attempt. */
+  async requestLogin(signal) {
+    throwIfAborted2(signal);
+    if (this.stopping) throw new Error("\u5FAE\u4FE1\u901A\u9053\u6B63\u5728\u505C\u6B62\uFF0C\u65E0\u6CD5\u53D1\u8D77\u626B\u7801");
+    if (this.connected) return { kind: "connected" };
+    let attempt = this.connectionAttempt;
+    if (attempt?.qrUrl !== void 0) {
+      await this.showQr(attempt.qrUrl);
+      return { kind: "qr-shown", reused: true, url: attempt.qrUrl };
+    }
+    if (attempt === void 0) attempt = this.launchConnection(true);
+    let readiness = await waitFor(attempt.ready, signal);
+    if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
+    if (readiness.kind === "connected") return { kind: "connected" };
+    if (!attempt.forceQr && !this.stopping) {
+      attempt = this.launchConnection(true);
+      readiness = await waitFor(attempt.ready, signal);
+      if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
+      if (readiness.kind === "connected") return { kind: "connected" };
+    }
+    throw readiness.error;
   }
   /** Abort long-polling and await all owned messages and agents. */
   async stop() {
@@ -1502,6 +1544,8 @@ var WeixinHarnessBridge = class {
     this.stopping = true;
     this.abortController.abort();
     this.conversations?.cancelPendingApprovals();
+    const connectionTask = this.connectionAttempt?.task;
+    if (connectionTask !== void 0) await Promise.allSettled([connectionTask]);
     if (this.monitorTask !== void 0) await this.monitorTask;
     await Promise.allSettled(this.inFlight);
     if (this.conversations !== void 0) await this.conversations.dispose();
@@ -1512,19 +1556,92 @@ var WeixinHarnessBridge = class {
         this.log.warn("Weixin notifyStop failed during teardown: %s", String(error));
       }
     }
+    this.connected = false;
   }
-  async resolveCredential() {
+  launchConnection(forceQr) {
+    if (this.stopping) throw new Error("\u5FAE\u4FE1\u901A\u9053\u6B63\u5728\u505C\u6B62\uFF0C\u65E0\u6CD5\u5EFA\u7ACB\u8FDE\u63A5");
+    if (this.connectionAttempt !== void 0) return this.connectionAttempt;
+    let resolveReady;
+    const ready = new Promise((resolve) => {
+      resolveReady = resolve;
+    });
+    const attempt = {
+      forceQr,
+      ready,
+      resolveReady,
+      task: Promise.resolve()
+    };
+    attempt.task = this.connect(forceQr, attempt);
+    this.connectionAttempt = attempt;
+    void attempt.task.then(
+      () => {
+        attempt.resolveReady({ kind: "connected" });
+        if (this.connectionAttempt === attempt) this.connectionAttempt = void 0;
+      },
+      (error) => {
+        attempt.resolveReady({ kind: "failed", error });
+        if (this.connectionAttempt === attempt) this.connectionAttempt = void 0;
+        if (!this.stopping) {
+          this.log.warn(
+            "Weixin channel remains offline: %s. Harness Web is unaffected; run /weixin-login to show a fresh QR code.",
+            String(error)
+          );
+        }
+      }
+    );
+    return attempt;
+  }
+  async connect(forceQr, attempt) {
+    const credential = await this.resolveCredential(forceQr, attempt);
+    throwIfAborted2(this.abortController.signal);
+    const api = this.apiFactory(credential, this.config);
+    const conversations = new ConversationManager(this.ctx, this.config, credential.accountId);
+    let notified = false;
+    try {
+      await conversations.initialize();
+      throwIfAborted2(this.abortController.signal);
+      await api.notifyStart();
+      notified = true;
+      throwIfAborted2(this.abortController.signal);
+    } catch (error) {
+      await Promise.allSettled([
+        conversations.dispose(),
+        ...notified ? [api.notifyStop()] : []
+      ]);
+      throw error;
+    }
+    this.credential = credential;
+    this.api = api;
+    this.conversations = conversations;
+    this.connected = true;
+    this.log.info("Weixin iLink credential verified for account %s", shortId2(credential.accountId));
+    this.monitorTask = this.monitor(api, credential).catch((error) => {
+      if (!this.stopping) this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
+    });
+  }
+  async resolveCredential(forceQr, attempt) {
     const ref = credentialRef(this.config.credentialRef);
-    const resolved = await this.ctx.credentials.resolve(ref);
-    if (resolved !== void 0) return parseCredential(resolved.value);
-    if (!this.config.autoLogin) {
+    if (!forceQr) {
+      const resolved = await this.ctx.credentials.resolve(ref);
+      if (resolved !== void 0) return parseCredential(resolved.value);
+    }
+    if (!forceQr && !this.config.autoLogin) {
       throw new Error(`weixin-channel: credential ${JSON.stringify(this.config.credentialRef)} is not configured`);
     }
-    this.log.info("No Weixin credential found; starting official QR login");
+    this.log.info(forceQr ? "Starting explicitly requested Weixin QR login" : "No Weixin credential found; starting official QR login");
     const credential = await this.login({
       timeoutMs: this.config.loginTimeoutMs,
-      callbacks: { status: (message) => this.log.info("%s", message) }
+      signal: this.abortController.signal,
+      callbacks: {
+        showQr: async (url) => {
+          attempt.qrUrl = url;
+          await this.showQr(url);
+          attempt.resolveReady({ kind: "qr", url });
+        },
+        status: (message) => this.log.info("%s", message)
+      }
     });
+    throwIfAborted2(this.abortController.signal);
     await this.ctx.credentials.set(ref, JSON.stringify(credential));
     this.log.info("Weixin credential stored by the Harness credential provider");
     return credential;
@@ -1779,6 +1896,36 @@ function resolveStatePath(configured, accountId) {
 function shortId2(value) {
   return value.length <= 12 ? value : value.slice(0, 12);
 }
+function throwIfAborted2(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error(typeof signal.reason === "string" ? signal.reason : "\u64CD\u4F5C\u5DF2\u53D6\u6D88");
+}
+function waitFor(promise, signal) {
+  if (signal === void 0) return promise;
+  throwIfAborted2(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener("abort", abort);
+      try {
+        throwIfAborted2(signal);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    void promise.then(
+      (value) => {
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      }
+    );
+  });
+}
 
 // src/config.ts
 import z from "@deepseek-ai/schemastery";
@@ -1788,7 +1935,8 @@ var Config = z.object({
   agentPreset: z.string(),
   permissionPreset: z.string(),
   statePath: z.string().default(""),
-  autoLogin: z.boolean().default(true),
+  controlSocketPath: z.string().default(""),
+  autoLogin: z.boolean().default(false),
   accessPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
   allowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
@@ -1827,32 +1975,85 @@ var inject = [
   "permissionPresets",
   "sessionPersistence"
 ];
-async function apply(ctx, config) {
+function mountBridge(ctx, bridge, control) {
+  ctx.effect(() => {
+    const unregisterLogin = ctx.commands.register({
+      name: "weixin-login",
+      description: "Show a fresh Weixin QR login code in the Harness terminal",
+      recordInput: false,
+      handler: async (invocation) => {
+        if (invocation.rawInput.trim() !== "") {
+          return { kind: "error", text: "\u7528\u6CD5\uFF1A/weixin-login\uFF08\u4E0D\u9700\u8981\u53C2\u6570\uFF09" };
+        }
+        try {
+          const result = await bridge.requestLogin(invocation.signal);
+          return loginCommandResult(result);
+        } catch (error) {
+          return {
+            kind: "error",
+            text: `\u65E0\u6CD5\u542F\u52A8\u5FAE\u4FE1\u626B\u7801\uFF1A${renderError(error)}\u3002Web \u670D\u52A1\u4E0D\u53D7\u5F71\u54CD\uFF0C\u53EF\u7A0D\u540E\u518D\u6B21\u8FD0\u884C /weixin-login\u3002`
+          };
+        }
+      }
+    });
+    bridge.startInBackground();
+    control?.startInBackground();
+    return async () => {
+      unregisterLogin();
+      await control?.stop();
+      await bridge.stop();
+    };
+  }, "deepseek-harness-weixin.lifecycle");
+}
+function apply(ctx, config) {
   const bridge = new WeixinHarnessBridge(ctx, config);
-  await ctx.effect(async function* () {
-    yield async () => bridge.stop();
-    await bridge.start();
-  }, "deepseek-harness-weixin.long-poll");
+  const control = new WeixinControlServer(
+    resolveControlSocketPath(config.controlSocketPath),
+    (signal) => bridge.requestLogin(signal),
+    ctx.logger("deepseek-harness-weixin")
+  );
+  mountBridge(ctx, bridge, control);
 }
 var index_default = { name, inject, Config, apply };
+function loginCommandResult(result) {
+  if (result.kind === "connected") {
+    return { kind: "success", text: "\u5FAE\u4FE1\u5DF2\u7ECF\u8FDE\u63A5\uFF0C\u65E0\u9700\u626B\u7801\u3002" };
+  }
+  return {
+    kind: "success",
+    text: result.reused ? "\u5F53\u524D\u626B\u7801\u6D41\u7A0B\u4ECD\u5728\u8FDB\u884C\uFF0C\u6700\u65B0\u4E8C\u7EF4\u7801\u5DF2\u91CD\u65B0\u8F93\u51FA\u5230\u8FD0\u884C pnpm dsh web \u7684\u7EC8\u7AEF\u3002" : "\u65B0\u7684\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u5DF2\u8F93\u51FA\u5230\u8FD0\u884C pnpm dsh web \u7684\u7EC8\u7AEF\uFF0C\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u5E76\u786E\u8BA4\u8FDE\u63A5\u3002"
+  };
+}
+function renderError(error) {
+  try {
+    return String(error);
+  } catch {
+    return "<\u65E0\u6CD5\u663E\u793A\u7684\u9519\u8BEF>";
+  }
+}
 export {
   Config,
   SeenMessageIds,
   StreamingMarkdownFilter,
   WeixinApiClient,
   WeixinApprovalRegistry,
+  WeixinControlServer,
   WeixinHarnessBridge,
   apply,
   index_default as default,
+  defaultControlSocketPath,
   detectImageMediaType,
   filterMarkdownForWeixin,
   formatApprovalPrompt,
   inboundContent,
   inject,
   loginWithQr,
+  mountBridge,
   name,
   parseApprovalCommand,
   parseCredential,
+  requestLoginFromControlSocket,
+  resolveControlSocketPath,
   sessionIdFor,
   truncateUtf8
 };

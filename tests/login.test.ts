@@ -55,4 +55,17 @@ describe('loginWithQr', () => {
     const fetchMock = vi.fn(async () => jsonResponse({ qrcode: 'missing-url' }))
     await expect(loginWithQr({ timeoutMs: 1_000, fetchImpl: fetchMock })).rejects.toThrow('有效二维码')
   })
+
+  it('cancels a pending QR request during plugin teardown', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.fn((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('aborted', 'AbortError'))
+      }, { once: true })
+    }))
+    const login = loginWithQr({ timeoutMs: 30_000, fetchImpl: fetchMock, signal: controller.signal })
+
+    controller.abort(new Error('plugin stopped'))
+    await expect(login).rejects.toThrow()
+  })
 })

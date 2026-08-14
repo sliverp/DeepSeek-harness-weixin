@@ -13,6 +13,7 @@ export interface Config {
   agentPreset?: string
   permissionPreset?: string
   statePath: string
+  controlSocketPath: string
   autoLogin: boolean
   accessPolicy: AccessMode
   allowFrom: string[]
@@ -43,7 +44,8 @@ export const Config: z<Config> = z.object({
   agentPreset: z.string(),
   permissionPreset: z.string(),
   statePath: z.string().default(''),
-  autoLogin: z.boolean().default(true),
+  controlSocketPath: z.string().default(''),
+  autoLogin: z.boolean().default(false),
   accessPolicy: z.union(['open', 'allowlist', 'disabled']).default('open'),
   allowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
