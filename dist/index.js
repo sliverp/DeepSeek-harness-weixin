@@ -704,8 +704,8 @@ import { createInterface } from "readline/promises";
 
 // src/protocol.ts
 import { createCipheriv, createDecipheriv, createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
-var CHANNEL_VERSION = "0.2.1";
-var BOT_AGENT = "DeepSeek-Harness/0.2.1";
+var CHANNEL_VERSION = "0.2.2";
+var BOT_AGENT = "DeepSeek-Harness/0.2.2";
 var ILINK_APP_ID = "bot";
 var ILINK_APP_CLIENT_VERSION = 2 << 16 | 4 << 8 | 6;
 var DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
