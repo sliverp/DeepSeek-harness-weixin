@@ -19,7 +19,7 @@ This is a DeepSeek Harness plugin, not an OpenClaw adapter. The iLink protocol, 
 - Automatic text-only fallback when the selected model cannot inspect images.
 - Allowlist/disabled access policy, bounded concurrency, deduplication, retries, and clean teardown.
 - `/bot-ping`, `/bot-help`, `/bot-status`, `/bot-image-test`, and `/bot-cancel` diagnostics.
-- On-demand QR login that never blocks Harness Web, with an explicit Linux CLI trigger.
+- On-demand QR login that never blocks Harness Web and can authorize independently before Web starts.
 - Same-chat `/approve <code>` and `/reject <code>` decisions for tool approval requests.
 - Persistent `/new` and `/reset` sessions plus direct dispatch of other Harness slash commands.
 
@@ -37,35 +37,39 @@ Tencent is rolling this feature out gradually. If the entry is absent, there is 
 
 ## Install
 
-Install directly from GitHub into the `web` profile:
+Install directly from GitHub into the `web` profile (the commands below assume that `dsh` is on the global `PATH`):
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
+dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
 ```
 
 Installation only updates the profile. Start the service with the command below, or restart it if it is already running:
 
 ```sh
-pnpm dsh web
+dsh web
 ```
 
-When `pnpm dsh web` starts, the plugin only restores an existing credential. Without one, the channel stays offline: it does not create a QR automatically and never blocks or stops Harness Web.
+When `dsh web` starts, the plugin only restores an existing credential. Without one, the channel stays offline: it does not create a QR automatically and never blocks or stops Harness Web.
 
 To log in or replace the currently connected Weixin account, open another Linux shell and run:
 
 ```sh
-pnpm dsh plugin --profile web exec dsh-weixin login
+dsh plugin --profile web exec dsh-weixin login --wait
 ```
 
-The command forces a new login even when Weixin is already connected; it no longer exits with an “already connected” notice. The old connection remains active until the scan is confirmed, then the plugin overwrites `WEIXIN_ILINK_CREDENTIAL` and hot-switches connections. It contacts the live plugin over an owner-only local Unix socket and displays a fresh QR, or the newest QR from an active attempt, in the invoking shell. It neither restarts Web nor waits for authorization, and no fallback URL is persisted in a session.
+`--wait` displays the QR first and then waits for Weixin authorization. It exits `0` on success and nonzero after a timeout, rejected scan, or credential-write failure. The command does not require `dsh web`: while Web is stopped, it completes the QR flow independently and writes `WEIXIN_ILINK_CREDENTIAL` through Harness's official credential store, ready for the next Web start. While Web is running, it asks the live plugin over an owner-only Unix socket; the old connection stays active until confirmation, and the command waits until the credential has been overwritten and the connection hot-switch has completed.
 
-Use URL-only mode when another script needs the QR URL:
+This always forces a fresh scan and overwrites the configuration, even when Weixin is already connected. It does not start or restart Web and never writes a QR link into a session. Run it again to obtain a new QR after expiration or timeout.
+
+Use URL-only mode when another script needs the QR URL and final status:
 
 ```sh
-pnpm --silent dsh plugin --profile web exec dsh-weixin login --url
+dsh plugin --profile web exec dsh-weixin login --url --wait
 ```
 
-On success, stdout is exactly the URL: no QR rendering, status text, or trailing newline. Errors still go to stderr. `--silent` suppresses pnpm's own `$ node ...` script banner. Run the command again after an attempt times out to begin a new attempt. Web `/weixin-login` remains available as a convenience, but is not required for CLI login.
+The URL is written immediately, after which the process remains alive until authorization finishes. Stdout is exactly the URL: no QR rendering, status text, or trailing newline. Diagnostics go to stderr. The process exits `0` after the live connection switch (or credential persistence while Web is stopped), and nonzero on timeout or failure, so scripts can rely on its exit status. Web `/weixin-login` remains available as a convenience, but is not required for CLI login.
+
+If `dsh` is not installed globally, replace it with `pnpm dsh`. For URL-only mode use `pnpm --silent dsh ...` so pnpm's own `$ node ...` banner does not contaminate stdout.
 
 Do not share the QR fallback URL or the stored JSON credential. Both authorize access to the linked ClawBot.
 
@@ -108,7 +112,7 @@ Override the row in `~/.dsh/profiles/web/cordis.patch.yml` when needed:
 
 When `statePath` is empty, the cursor is stored under `~/.dsh/weixin/`. The plugin creates the file atomically with mode `0600`.
 
-When `controlSocketPath` is empty, it defaults to `~/.dsh/weixin/control.sock`; the directory is mode `0700` and the socket is mode `0600`. For a custom path, give the CLI the same `DSH_WEIXIN_CONTROL_SOCKET` environment variable or pass `dsh-weixin login --socket <path>`.
+When `controlSocketPath` is empty, it defaults to `~/.dsh/weixin/control.sock`; the directory is mode `0700` and the socket is mode `0600`. It is used only for a live Web hot-switch and is not a prerequisite for `login --wait`. For a custom path, give the CLI the same `DSH_WEIXIN_CONTROL_SOCKET` environment variable or pass `dsh-weixin login --socket <path>`.
 
 `autoLogin` defaults to `false`: without a credential, the channel stays offline until the Linux command above requests QR login. Set it to `true` to restore automatic background QR display during Web startup; neither setting allows QR login to block Web.
 
@@ -158,7 +162,7 @@ To verify tool approval, send “我当前有啥文件？”. After receiving `B
 
 ## Relogin
 
-Run `pnpm dsh plugin --profile web exec dsh-weixin login` to force a fresh scan and overwrite `WEIXIN_ILINK_CREDENTIAL`; deleting the old credential first is unnecessary. If Weixin reports that ClawBot is already bound to another local instance, remove the old connection in Weixin first.
+Run `dsh plugin --profile web exec dsh-weixin login --wait` to force a fresh scan and overwrite `WEIXIN_ILINK_CREDENTIAL`; deleting the old credential first is unnecessary. If Weixin reports that ClawBot is already bound to another local instance, remove the old connection in Weixin first.
 
 ## Development
 

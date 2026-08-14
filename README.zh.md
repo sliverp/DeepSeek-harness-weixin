@@ -19,7 +19,7 @@
 - 当前模型不支持视觉时，自动保存图片并降级为附件说明。
 - 支持允许名单、禁用策略、有界并发、去重、重试和完整清理。
 - 内置 `/bot-ping`、`/bot-help`、`/bot-status`、`/bot-image-test`、`/bot-cancel`。
-- 按需扫码不阻塞 Harness Web；可从 Linux 终端主动生成或重显二维码。
+- 按需扫码不阻塞 Harness Web；Linux 登录命令可在 Web 启动前独立完成授权。
 - 工具请求审批时，可在同一微信会话用 `/approve <短码>` 或 `/reject <短码>` 决定。
 - `/new`、`/reset` 创建新的持久 session；其他 Harness 斜杠命令直接进入命令运行时。
 
@@ -37,35 +37,39 @@
 
 ## 安装
 
-直接从 GitHub 安装到 `web` profile：
+直接从 GitHub 安装到 `web` profile（以下假设 `dsh` 已加入全局 `PATH`）：
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
+dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
 ```
 
 安装只会更新 profile。服务尚未运行时用下面的命令启动；已经运行则重启：
 
 ```sh
-pnpm dsh web
+dsh web
 ```
 
-启动 `pnpm dsh web` 时，插件只会恢复已有凭据；没有凭据时保持离线，不会自动创建二维码，也不会阻塞或关闭 Harness Web。
+启动 `dsh web` 时，插件只会恢复已有凭据；没有凭据时保持离线，不会自动创建二维码，也不会阻塞或关闭 Harness Web。
 
-需要扫码登录或更换当前微信账号时，另开一个 Linux 终端运行：
+需要扫码登录或更换当前微信账号时，运行：
 
 ```sh
-pnpm dsh plugin --profile web exec dsh-weixin login
+dsh plugin --profile web exec dsh-weixin login --wait
 ```
 
-这个命令即使微信已经连接也会强制发起重新登录，不再返回“微信已经连接，无需扫码”。扫码确认前旧连接继续工作；确认成功后，插件会覆盖 `WEIXIN_ILINK_CREDENTIAL` 并热切换到新连接。命令通过仅当前用户可访问的本机 Unix Socket 联系运行中的插件，并把新二维码或当前扫码流程的最新二维码显示在执行命令的终端。它不会重启 Web、不会等待扫码完成，也不会把备用链接写入 session。扫码流程最终超时后，再次执行即可开始全新流程。
+`--wait` 会先显示二维码，再持续等待微信授权；成功退出码为 `0`，超时、扫码失败或凭据写入失败时退出码非 `0`。这个命令不要求 `dsh web` 已经运行：Web 未运行时，它会独立完成扫码并通过 Harness 官方凭据存储写入 `WEIXIN_ILINK_CREDENTIAL`，以后启动 Web 会自动恢复连接；Web 已运行时，它会使用仅当前用户可访问的本机 Unix Socket 请求插件登录，扫码确认前保留旧连接，确认后覆盖凭据并等待热切换完成。
 
-只需要二维码 URL（例如交给其他脚本）时使用：
+这个流程即使微信已经连接也会强制重新扫码并覆盖配置，不会返回“微信已经连接，无需扫码”。命令不会启动或重启 Web，也不会把二维码链接写入 session。二维码失效或流程超时后，重新运行命令即可生成新二维码。
+
+只需要二维码 URL（例如交给其他脚本）并等待最终结果时使用：
 
 ```sh
-pnpm --silent dsh plugin --profile web exec dsh-weixin login --url
+dsh plugin --profile web exec dsh-weixin login --url --wait
 ```
 
-成功时，该模式的标准输出严格等于 URL 本身：不渲染二维码、不输出提示文字，也不附加换行；错误仍写入标准错误。这里的 `--silent` 用于关闭 pnpm 自己输出的 `$ node ...` 脚本提示。Web 中的 `/weixin-login` 也保留为辅助入口，但不是使用命令行扫码的前提。
+该模式会立即把 URL 写到标准输出，然后保持进程运行直到授权完成。标准输出严格等于 URL 本身：不渲染二维码、不输出状态文字，也不附加换行；诊断写入标准错误。扫码并完成连接切换（或在 Web 未运行时完成凭据持久化）后退出 `0`，超时或失败退出非 `0`，因此脚本可以直接检查退出码。Web 中的 `/weixin-login` 仍保留为辅助入口，但不是 Linux 命令扫码的前提。
+
+如果没有全局 `dsh`，可以把上述命令中的 `dsh` 换成 `pnpm dsh`；URL-only 模式应使用 `pnpm --silent dsh ...`，避免 pnpm 自己的 `$ node ...` 提示混入标准输出。
 
 不要转发二维码备用链接，也不要复制或提交保存后的 JSON 凭据；两者都能授权访问已连接的 ClawBot。
 
@@ -108,7 +112,7 @@ pnpm --silent dsh plugin --profile web exec dsh-weixin login --url
 
 `statePath` 为空时，游标默认保存在 `~/.dsh/weixin/`，并以原子写入和 `0600` 文件权限保护。
 
-`controlSocketPath` 为空时默认为 `~/.dsh/weixin/control.sock`，目录权限为 `0700`，Socket 权限为 `0600`。如自定义路径，CLI 使用相同的 `DSH_WEIXIN_CONTROL_SOCKET` 环境变量，或传入 `dsh-weixin login --socket <path>`。
+`controlSocketPath` 为空时默认为 `~/.dsh/weixin/control.sock`，目录权限为 `0700`，Socket 权限为 `0600`。它只用于 Web 已运行时的登录热切换，不是 `login --wait` 的启动前提。如自定义路径，CLI 使用相同的 `DSH_WEIXIN_CONTROL_SOCKET` 环境变量，或传入 `dsh-weixin login --socket <path>`。
 
 `autoLogin` 默认为 `false`：缺少凭据时保持离线，只有运行上面的 Linux 命令才发起扫码。设为 `true` 可恢复启动 Web 时在后台自动显示二维码的行为；无论取值如何，扫码都不会阻塞 Web。
 
@@ -158,7 +162,7 @@ pong — DeepSeek Harness 微信机器人已连接。
 
 ## 重新登录
 
-无需先删除凭据，直接运行 `pnpm dsh plugin --profile web exec dsh-weixin login` 即可强制重新扫码并覆盖 `WEIXIN_ILINK_CREDENTIAL`。如果微信提示 ClawBot 已绑定其他本地实例，请先在微信中解除旧连接。
+无需先删除凭据，直接运行 `dsh plugin --profile web exec dsh-weixin login --wait` 即可强制重新扫码并覆盖 `WEIXIN_ILINK_CREDENTIAL`。如果微信提示 ClawBot 已绑定其他本地实例，请先在微信中解除旧连接。
 
 ## 开发
 

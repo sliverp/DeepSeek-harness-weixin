@@ -36,8 +36,13 @@ export type WeixinLogin = typeof loginWithQr
 export type WeixinQrDisplay = (url: string) => Promise<void>
 
 /** Outcome of an explicit login request from a Harness command surface. */
-export type WeixinLoginRequest =
-  { kind: 'qr-shown'; reused: boolean; url: string }
+export type WeixinLoginRequest = {
+  kind: 'qr-shown'
+  reused: boolean
+  url: string
+  /** Resolves only after authorization, credential persistence, and hot-switch finish. */
+  completion: Promise<WeixinCredential>
+}
 
 type ConnectionReadiness =
   | { kind: 'connected' }
@@ -49,7 +54,7 @@ interface ConnectionAttempt {
   readonly ready: Promise<ConnectionReadiness>
   readonly resolveReady: (readiness: ConnectionReadiness) => void
   displayQr: boolean
-  task: Promise<void>
+  task: Promise<WeixinCredential>
   qrUrl?: string
 }
 
@@ -109,19 +114,23 @@ export class WeixinHarnessBridge {
     if (attempt !== undefined && displayQr) attempt.displayQr = true
     if (attempt?.qrUrl !== undefined) {
       if (displayQr) await this.showQr(attempt.qrUrl)
-      return { kind: 'qr-shown', reused: true, url: attempt.qrUrl }
+      return { kind: 'qr-shown', reused: true, url: attempt.qrUrl, completion: attempt.task }
     }
 
     if (attempt === undefined) attempt = this.launchConnection(true, displayQr)
     let readiness = await waitFor(attempt.ready, signal)
-    if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
+    if (readiness.kind === 'qr') {
+      return { kind: 'qr-shown', reused: false, url: readiness.url, completion: attempt.task }
+    }
 
     // If a normal background restore wins the race, explicit login still starts
     // a fresh QR flow so the persisted credential can be replaced.
     if (!attempt.forceQr && !this.stopping) {
       attempt = this.launchConnection(true, displayQr)
       readiness = await waitFor(attempt.ready, signal)
-      if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
+      if (readiness.kind === 'qr') {
+        return { kind: 'qr-shown', reused: false, url: readiness.url, completion: attempt.task }
+      }
     }
     if (readiness.kind === 'connected') throw new Error('微信重新登录流程没有返回二维码')
     throw readiness.error
@@ -146,14 +155,15 @@ export class WeixinHarnessBridge {
 
     let resolveReady!: (readiness: ConnectionReadiness) => void
     const ready = new Promise<ConnectionReadiness>(resolve => { resolveReady = resolve })
-    const attempt: ConnectionAttempt = {
+    let attempt!: ConnectionAttempt
+    const task = Promise.resolve().then(() => this.connect(forceQr, attempt))
+    attempt = {
       forceQr,
       ready,
       resolveReady,
       displayQr,
-      task: Promise.resolve(),
+      task,
     }
-    attempt.task = this.connect(forceQr, attempt)
     this.connectionAttempt = attempt
     void attempt.task.then(
       () => {
@@ -178,7 +188,7 @@ export class WeixinHarnessBridge {
     return attempt
   }
 
-  private async connect(forceQr: boolean, attempt: ConnectionAttempt): Promise<void> {
+  private async connect(forceQr: boolean, attempt: ConnectionAttempt): Promise<WeixinCredential> {
     const credential = await this.resolveCredential(forceQr, attempt)
     throwIfAborted(this.abortController.signal)
     await this.disconnectActive()
@@ -212,6 +222,7 @@ export class WeixinHarnessBridge {
         this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
       }
     })
+    return credential
   }
 
   private async resolveCredential(forceQr: boolean, attempt: ConnectionAttempt): Promise<WeixinCredential> {

@@ -230,7 +230,8 @@ describe('WeixinHarnessBridge', () => {
     })
     const result = await bridge.requestLogin()
 
-    expect(result).toEqual({ kind: 'qr-shown', reused: false, url: 'https://qr.example/fresh' })
+    expect(result).toMatchObject({ kind: 'qr-shown', reused: false, url: 'https://qr.example/fresh' })
+    await expect(result.completion).resolves.toEqual(CREDENTIAL)
     expect(showQr).toHaveBeenCalledWith('https://qr.example/fresh')
     expect(login).toHaveBeenCalledOnce()
     await bridge.start()
@@ -264,7 +265,8 @@ describe('WeixinHarnessBridge', () => {
     )
     await bridge.start()
 
-    await expect(bridge.requestLogin(undefined, false)).resolves.toEqual({
+    const result = await bridge.requestLogin(undefined, false)
+    expect(result).toMatchObject({
       kind: 'qr-shown',
       reused: false,
       url: 'https://qr.example/replacement',
@@ -276,6 +278,7 @@ describe('WeixinHarnessBridge', () => {
     expect(oldApi.notifyStop).not.toHaveBeenCalled()
 
     finishLogin(REPLACEMENT_CREDENTIAL)
+    await expect(result.completion).resolves.toEqual(REPLACEMENT_CREDENTIAL)
     await vi.waitFor(() => expect(replacementApi.notifyStart).toHaveBeenCalledOnce())
     expect(oldApi.notifyStop).toHaveBeenCalledOnce()
     expect((ctx as { credentials: { set: ReturnType<typeof vi.fn> } }).credentials.set)
@@ -306,11 +309,13 @@ describe('WeixinHarnessBridge', () => {
 
     bridge.startInBackground()
     await vi.waitFor(() => expect(login).toHaveBeenCalledTimes(1))
-    await expect(bridge.requestLogin()).resolves.toEqual({
+    const result = await bridge.requestLogin()
+    expect(result).toMatchObject({
       kind: 'qr-shown',
       reused: false,
       url: 'https://qr.example/after-expiry',
     })
+    await expect(result.completion).resolves.toEqual(CREDENTIAL)
     expect(login).toHaveBeenCalledTimes(2)
     expect(showQr).toHaveBeenCalledWith('https://qr.example/after-expiry')
 
@@ -337,7 +342,8 @@ describe('WeixinHarnessBridge', () => {
 
     bridge.startInBackground()
     await vi.waitFor(() => expect(showQr).toHaveBeenCalledOnce())
-    await expect(bridge.requestLogin()).resolves.toEqual({
+    const result = await bridge.requestLogin()
+    expect(result).toMatchObject({
       kind: 'qr-shown',
       reused: true,
       url: 'https://qr.example/current',
@@ -346,6 +352,7 @@ describe('WeixinHarnessBridge', () => {
     expect(login).toHaveBeenCalledOnce()
 
     finishLogin(CREDENTIAL)
+    await expect(result.completion).resolves.toEqual(CREDENTIAL)
     await bridge.start()
     await bridge.stop()
   })

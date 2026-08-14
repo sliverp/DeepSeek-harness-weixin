@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { mountBridge } from '../src/index.js'
 
+const CREDENTIAL = {
+  token: 'test-token',
+  accountId: 'account@im.bot',
+  baseUrl: 'https://ilink.example',
+}
+
 describe('Weixin plugin lifecycle', () => {
   it('does not block Harness startup and registers an active QR command', async () => {
     let dispose: (() => Promise<void>) | undefined
@@ -27,6 +33,7 @@ describe('Weixin plugin lifecycle', () => {
         kind: 'qr-shown' as const,
         reused: false,
         url: 'https://qr.example/secret',
+        completion: Promise.resolve(CREDENTIAL),
       })),
       stop: vi.fn(async () => undefined),
     }

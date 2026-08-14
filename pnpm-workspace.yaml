@@ -34,3 +34,5 @@ minimumReleaseAgeExclude:
   - '@deepseek-ai/dsh-session-projection@0.1.0-rc.6'
   - '@deepseek-ai/dsh-shell@0.1.0-rc.6'
   - '@deepseek-ai/dsh-subprocess@0.1.0-rc.6'
+  - '@deepseek-ai/dsh-credentials-local@0.1.0-rc.6'
+  - '@deepseek-ai/dsh-launch-environment@0.1.0-rc.6'

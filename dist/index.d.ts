@@ -184,6 +184,8 @@ type WeixinLoginRequest = {
     kind: 'qr-shown';
     reused: boolean;
     url: string;
+    /** Resolves only after authorization, credential persistence, and hot-switch finish. */
+    completion: Promise<WeixinCredential>;
 };
 /** Live Weixin iLink long-poll ↔ DeepSeek Harness bridge. */
 declare class WeixinHarnessBridge {
@@ -342,6 +344,13 @@ type WeixinControlResponse = {
     kind: 'qr';
     reused: boolean;
     url: string;
+    loginId?: string;
+} | {
+    ok: true;
+    kind: 'connected';
+    accountId: string;
+    userId?: string;
+    baseUrl: string;
 } | {
     ok: false;
     error: string;
@@ -366,6 +375,8 @@ declare class WeixinControlServer {
     private server;
     private startTask;
     private readonly clients;
+    private readonly loginIds;
+    private readonly loginCompletions;
     private ownsSocket;
     private stopping;
     constructor(socketPath: string, requestLogin: (signal?: AbortSignal, displayQr?: boolean) => Promise<WeixinLoginRequest>, log: WeixinControlLogger);
@@ -376,10 +387,29 @@ declare class WeixinControlServer {
     private start;
     private accept;
     private handle;
+    private trackLogin;
     private respond;
 }
 /** Ask the live plugin for a QR from a one-shot Linux CLI process. */
 declare function requestLoginFromControlSocket(socketPath: string, options?: WeixinControlRequestOptions | number): Promise<WeixinControlResponse>;
+/** Wait for one QR attempt to finish authorization and hot-switching. */
+declare function waitForLoginFromControlSocket(socketPath: string, loginId: string, timeoutMs?: number): Promise<WeixinControlResponse>;
+
+interface StandaloneLoginOptions {
+    credentialRef: string;
+    timeoutMs: number;
+    showQr(url: string): Promise<void>;
+    status(message: string): void;
+    readVerifyCode?(prompt: string, signal?: AbortSignal): Promise<string>;
+    signal?: AbortSignal;
+}
+/** Injectable QR operation for standalone CLI tests. */
+type StandaloneQrLogin = typeof loginWithQr;
+/**
+ * Complete QR authorization without a running Harness composition and commit
+ * the result through Harness's own locked, atomic local credential provider.
+ */
+declare function loginStandalone(options: StandaloneLoginOptions, login?: StandaloneQrLogin): Promise<WeixinCredential>;
 
 /** Deterministic, non-identifying DSH session id for one Weixin user. */
 declare function sessionIdFor(accountId: string, message: Pick<WeixinMessage, 'from_user_id'>): string;
@@ -417,4 +447,4 @@ declare const _default: {
     apply: typeof apply;
 };
 
-export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlRequestOptions, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, sessionIdFor, truncateUtf8 };
+export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, type StandaloneLoginOptions, type StandaloneQrLogin, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlRequestOptions, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginStandalone, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, sessionIdFor, truncateUtf8, waitForLoginFromControlSocket };

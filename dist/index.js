@@ -1,12 +1,26 @@
 import {
+  MessageItemType,
+  MessageType,
+  SeenMessageIds,
+  WeixinApiClient,
   WeixinControlServer,
   defaultControlSocketPath,
+  delay,
+  displayQr,
+  loginStandalone,
+  loginWithQr,
+  messageKey,
+  parseCredential,
   requestLoginFromControlSocket,
-  resolveControlSocketPath
-} from "./chunk-LVGDSBED.js";
+  resolveControlSocketPath,
+  sessionIdFor,
+  truncateUtf8,
+  waitForLoginFromControlSocket,
+  withTimeout
+} from "./chunk-CFBWVOH7.js";
 
 // src/bridge.ts
-import { createHash as createHash3 } from "crypto";
+import { createHash } from "crypto";
 import { homedir } from "os";
 import { isAbsolute, join } from "path";
 import { parseCommand as parseCommand2 } from "@deepseek-ai/dsh-commands";
@@ -14,85 +28,6 @@ import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 // src/approvals.ts
 import { randomInt } from "crypto";
-
-// src/util.ts
-import { createHash, randomBytes } from "crypto";
-var SESSION_NAMESPACE = "weixin-v3-single";
-function sessionIdFor(accountId, message) {
-  const userId = message.from_user_id?.trim();
-  if (!userId) throw new Error("Weixin message has no sender identifier");
-  const digest = createHash("sha256").update(`${accountId}\0${userId}`).digest("hex").slice(0, 32);
-  return `${SESSION_NAMESPACE}-${digest}`;
-}
-function truncateUtf8(text, maxBytes, suffix = "\n\n[\u56DE\u590D\u5DF2\u622A\u65AD]") {
-  const normalized = text.trim();
-  if (Buffer.byteLength(normalized) <= maxBytes) return normalized;
-  const suffixBytes = Buffer.byteLength(suffix);
-  const available = Math.max(0, maxBytes - suffixBytes);
-  let result = "";
-  let bytes = 0;
-  for (const codePoint of normalized) {
-    const size = Buffer.byteLength(codePoint);
-    if (bytes + size > available) break;
-    result += codePoint;
-    bytes += size;
-  }
-  return result + (suffixBytes <= maxBytes ? suffix : "");
-}
-async function withTimeout(task, timeoutMs, label) {
-  let timer;
-  try {
-    return await Promise.race([
-      task,
-      new Promise((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
-      })
-    ]);
-  } finally {
-    if (timer !== void 0) clearTimeout(timer);
-  }
-}
-function delay(ms, signal) {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-  });
-}
-var SeenMessageIds = class {
-  constructor(limit) {
-    this.limit = limit;
-  }
-  limit;
-  ids = /* @__PURE__ */ new Set();
-  /** Return true for a duplicate; record a new id otherwise. */
-  hasOrAdd(id) {
-    if (this.ids.has(id)) return true;
-    this.ids.add(id);
-    while (this.ids.size > this.limit) {
-      const oldest = this.ids.values().next().value;
-      if (oldest === void 0) break;
-      this.ids.delete(oldest);
-    }
-    return false;
-  }
-};
-function messageKey(message) {
-  if (message.message_id !== void 0) return String(message.message_id);
-  if (message.client_id?.trim()) return message.client_id;
-  return createHash("sha256").update(JSON.stringify(message)).digest("hex");
-}
-function generateClientId() {
-  return `dsh-weixin:${Date.now()}-${randomBytes(4).toString("hex")}`;
-}
-
-// src/approvals.ts
 function parseApprovalCommand(text) {
   const trimmed = text.trim();
   if (!/^\/(?:approve|reject)(?:\s|$)/i.test(trimmed)) return void 0;
@@ -210,53 +145,6 @@ import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { parseCommand } from "@deepseek-ai/dsh-commands";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
-
-// src/types.ts
-var UploadMediaType = { IMAGE: 1, VIDEO: 2, FILE: 3, VOICE: 4 };
-var MessageItemType = {
-  NONE: 0,
-  TEXT: 1,
-  IMAGE: 2,
-  VOICE: 3,
-  FILE: 4,
-  VIDEO: 5
-};
-var MessageType = { NONE: 0, USER: 1, BOT: 2 };
-var MessageState = { NEW: 0, GENERATING: 1, FINISH: 2 };
-function parseCredential(value) {
-  let parsed;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error("weixin-channel: managed credential is not valid JSON");
-  }
-  if (parsed === null || typeof parsed !== "object") {
-    throw new Error("weixin-channel: managed credential must be a JSON object");
-  }
-  const data = parsed;
-  if (typeof data.token !== "string" || data.token.trim() === "") {
-    throw new Error("weixin-channel: managed credential has no token");
-  }
-  if (typeof data.accountId !== "string" || data.accountId.trim() === "") {
-    throw new Error("weixin-channel: managed credential has no accountId");
-  }
-  if (typeof data.baseUrl !== "string" || !isHttpsUrl(data.baseUrl)) {
-    throw new Error("weixin-channel: managed credential baseUrl must be an HTTPS URL");
-  }
-  return {
-    token: data.token.trim(),
-    accountId: data.accountId.trim(),
-    baseUrl: data.baseUrl.replace(/\/+$/, ""),
-    ...typeof data.userId === "string" && data.userId.trim() ? { userId: data.userId.trim() } : {}
-  };
-}
-function isHttpsUrl(value) {
-  try {
-    return new URL(value).protocol === "https:";
-  } catch {
-    return false;
-  }
-}
 
 // src/inbound.ts
 async function inboundContent(ctx, config, api, message, includeImages = true) {
@@ -699,412 +587,6 @@ var ConversationManager = class {
   }
 };
 
-// src/login.ts
-import { createInterface } from "readline/promises";
-
-// src/protocol.ts
-import { createCipheriv, createDecipheriv, createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
-var CHANNEL_VERSION = "0.2.3";
-var BOT_AGENT = "DeepSeek-Harness/0.2.3";
-var ILINK_APP_ID = "bot";
-var ILINK_APP_CLIENT_VERSION = 2 << 16 | 4 << 8 | 6;
-var DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
-var WeixinApiClient = class {
-  constructor(baseUrl, token, config, fetchImpl = fetch) {
-    this.baseUrl = baseUrl;
-    this.token = token;
-    this.config = config;
-    this.fetchImpl = fetchImpl;
-  }
-  baseUrl;
-  token;
-  config;
-  fetchImpl;
-  cdnBaseUrl = DEFAULT_CDN_BASE_URL;
-  async getUpdates(cursor, timeoutMs, signal) {
-    try {
-      return await this.postJson("ilink/bot/getupdates", {
-        get_updates_buf: cursor,
-        base_info: baseInfo()
-      }, timeoutMs, "getUpdates", signal);
-    } catch (error) {
-      if (isAbort(error)) return { ret: 0, msgs: [], get_updates_buf: cursor };
-      throw error;
-    }
-  }
-  async notifyStart() {
-    const response = await this.postJson(
-      "ilink/bot/msg/notifystart",
-      { base_info: baseInfo() },
-      this.config.apiTimeoutMs,
-      "notifyStart"
-    );
-    assertSuccess(response, "notifyStart");
-  }
-  async notifyStop() {
-    const response = await this.postJson(
-      "ilink/bot/msg/notifystop",
-      { base_info: baseInfo() },
-      this.config.apiTimeoutMs,
-      "notifyStop"
-    );
-    assertSuccess(response, "notifyStop");
-  }
-  async sendText(to, text, contextToken) {
-    const item = { type: MessageItemType.TEXT, text_item: { text } };
-    await this.sendItem(to, item, contextToken);
-  }
-  async sendImage(to, data, contextToken) {
-    const plaintext = Buffer.from(data);
-    if (plaintext.byteLength > this.config.maxOutboundImageBytes) {
-      throw new Error(`Weixin outbound image exceeds the ${this.config.maxOutboundImageBytes}-byte limit`);
-    }
-    const key = randomBytes2(16);
-    const filekey = randomBytes2(16).toString("hex");
-    const encrypted = encryptAesEcb(plaintext, key);
-    const upload = await this.postJson("ilink/bot/getuploadurl", {
-      filekey,
-      media_type: UploadMediaType.IMAGE,
-      to_user_id: to,
-      rawsize: plaintext.byteLength,
-      rawfilemd5: createHash2("md5").update(plaintext).digest("hex"),
-      filesize: encrypted.byteLength,
-      no_need_thumb: true,
-      aeskey: key.toString("hex"),
-      base_info: baseInfo()
-    }, this.config.apiTimeoutMs, "getUploadUrl");
-    const uploadUrl = upload.upload_full_url?.trim() || (upload.upload_param ? `${this.cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param)}&filekey=${encodeURIComponent(filekey)}` : "");
-    if (!uploadUrl) throw new Error("getUploadUrl returned no CDN upload URL");
-    const downloadParam = await this.uploadEncrypted(uploadUrl, encrypted);
-    await this.sendItem(to, {
-      type: MessageItemType.IMAGE,
-      image_item: {
-        media: {
-          encrypt_query_param: downloadParam,
-          aes_key: Buffer.from(key.toString("hex")).toString("base64"),
-          encrypt_type: 1
-        },
-        mid_size: encrypted.byteLength
-      }
-    }, contextToken);
-  }
-  async downloadImage(image, timeoutMs) {
-    const media = image.media;
-    if (media === void 0) throw new Error("Weixin image has no CDN media reference");
-    const encryptedQuery = media.encrypt_query_param ?? "";
-    const url = media.full_url?.trim() || (encryptedQuery ? `${this.cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptedQuery)}` : "");
-    if (!url) throw new Error("Weixin image has no CDN download URL");
-    const response = await fetchWithTimeout(this.fetchImpl, url, { method: "GET" }, timeoutMs);
-    if (!response.ok) throw new Error(`Weixin CDN download failed with HTTP ${response.status}`);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const key = image.aeskey?.trim() ? parseHexKey(image.aeskey) : media.aes_key?.trim() ? parseBase64Key(media.aes_key) : void 0;
-    return key === void 0 ? bytes : decryptAesEcb(bytes, key);
-  }
-  async sendItem(to, item, contextToken) {
-    const response = await this.postJson("ilink/bot/sendmessage", {
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: generateClientId(),
-        message_type: MessageType.BOT,
-        message_state: MessageState.FINISH,
-        item_list: [item],
-        ...contextToken === void 0 ? {} : { context_token: contextToken }
-      },
-      base_info: baseInfo()
-    }, this.config.apiTimeoutMs, "sendMessage");
-    assertSuccess(response, "sendMessage");
-  }
-  async uploadEncrypted(url, encrypted) {
-    let lastError;
-    for (let attempt = 0; attempt <= this.config.sendRetries; attempt += 1) {
-      try {
-        const response = await fetchWithTimeout(this.fetchImpl, url, {
-          method: "POST",
-          headers: { "Content-Type": "application/octet-stream" },
-          body: new Uint8Array(encrypted)
-        }, this.config.apiTimeoutMs);
-        if (!response.ok) throw new Error(`Weixin CDN upload failed with HTTP ${response.status}`);
-        const param = response.headers.get("x-encrypted-param");
-        if (!param) throw new Error("Weixin CDN upload response has no x-encrypted-param");
-        return param;
-      } catch (error) {
-        lastError = error;
-        if (attempt < this.config.sendRetries) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-      }
-    }
-    throw lastError;
-  }
-  postJson(endpoint, body, timeoutMs, label, signal) {
-    return requestJson(this.fetchImpl, {
-      url: new URL(endpoint, ensureTrailingSlash(this.baseUrl)).toString(),
-      method: "POST",
-      headers: authenticatedHeaders(this.token),
-      body,
-      timeoutMs,
-      label,
-      ...signal === void 0 ? {} : { signal }
-    });
-  }
-};
-function requestQrJson(method, url, timeoutMs, body, fetchImpl = fetch, signal) {
-  return requestJson(fetchImpl, {
-    url,
-    method,
-    headers: commonHeaders(),
-    ...body === void 0 ? {} : { body },
-    timeoutMs,
-    label: "Weixin QR login",
-    ...signal === void 0 ? {} : { signal }
-  });
-}
-function requestJson(fetchImpl, options) {
-  return (async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), options.timeoutMs);
-    const abort = () => controller.abort();
-    options.signal?.addEventListener("abort", abort, { once: true });
-    try {
-      const response = await fetchImpl(options.url, {
-        method: options.method,
-        headers: options.headers,
-        ...options.body === void 0 ? {} : { body: JSON.stringify(options.body) },
-        signal: controller.signal
-      });
-      const text = await response.text();
-      if (!response.ok) throw new Error(`${options.label} failed with HTTP ${response.status}`);
-      try {
-        return JSON.parse(text);
-      } catch {
-        throw new Error(`${options.label} returned invalid JSON`);
-      }
-    } finally {
-      clearTimeout(timer);
-      options.signal?.removeEventListener("abort", abort);
-    }
-  })();
-}
-async function fetchWithTimeout(fetchImpl, url, init, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetchImpl(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-function baseInfo() {
-  return { channel_version: CHANNEL_VERSION, bot_agent: BOT_AGENT };
-}
-function commonHeaders() {
-  return {
-    "Content-Type": "application/json",
-    "iLink-App-Id": ILINK_APP_ID,
-    "iLink-App-ClientVersion": String(ILINK_APP_CLIENT_VERSION)
-  };
-}
-function authenticatedHeaders(token) {
-  const uin = randomBytes2(4).readUInt32BE(0);
-  return {
-    ...commonHeaders(),
-    AuthorizationType: "ilink_bot_token",
-    Authorization: `Bearer ${token}`,
-    "X-WECHAT-UIN": Buffer.from(String(uin)).toString("base64")
-  };
-}
-function ensureTrailingSlash(value) {
-  return value.endsWith("/") ? value : `${value}/`;
-}
-function assertSuccess(response, label) {
-  const code = response.errcode ?? response.ret ?? 0;
-  if (code !== 0) throw new Error(`${label} failed with iLink code ${code}: ${response.errmsg ?? "(no message)"}`);
-}
-function encryptAesEcb(plaintext, key) {
-  const cipher = createCipheriv("aes-128-ecb", key, null);
-  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
-}
-function decryptAesEcb(ciphertext, key) {
-  const decipher = createDecipheriv("aes-128-ecb", key, null);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-}
-function parseHexKey(value) {
-  if (!/^[0-9a-fA-F]{32}$/.test(value)) throw new Error("Weixin image AES hex key is invalid");
-  return Buffer.from(value, "hex");
-}
-function parseBase64Key(value) {
-  const decoded = Buffer.from(value, "base64");
-  if (decoded.length === 16) return decoded;
-  const ascii = decoded.toString("ascii");
-  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(ascii)) return Buffer.from(ascii, "hex");
-  throw new Error("Weixin image AES key has an invalid length");
-}
-function isAbort(error) {
-  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
-}
-
-// src/login.ts
-var FIXED_BASE_URL = "https://ilinkai.weixin.qq.com";
-var BOT_TYPE = "3";
-var QR_POLL_TIMEOUT_MS = 35e3;
-var MAX_QR_REFRESHES = 3;
-async function loginWithQr(options) {
-  const callbacks = {
-    showQr: options.callbacks?.showQr ?? displayQr,
-    readVerifyCode: options.callbacks?.readVerifyCode ?? readVerifyCode,
-    status: options.callbacks?.status ?? ((message) => process.stdout.write(`${message}
-`))
-  };
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const deadline = Date.now() + options.timeoutMs;
-  let currentBaseUrl = FIXED_BASE_URL;
-  let refreshes = 0;
-  let pendingVerifyCode;
-  let scanned = false;
-  throwIfAborted(options.signal);
-  let qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal);
-  await callbacks.showQr(qr.url);
-  callbacks.status("\u8BF7\u7528\u624B\u673A\u5FAE\u4FE1\u626B\u63CF\u4E8C\u7EF4\u7801\uFF0C\u5E76\u5728\u5FAE\u4FE1\u4E2D\u786E\u8BA4\u8FDE\u63A5\u3002");
-  while (Date.now() < deadline) {
-    throwIfAborted(options.signal);
-    const remaining = deadline - Date.now();
-    let response;
-    try {
-      response = await pollStatus(
-        currentBaseUrl,
-        qr.id,
-        pendingVerifyCode,
-        Math.min(QR_POLL_TIMEOUT_MS, remaining),
-        fetchImpl,
-        options.signal
-      );
-    } catch (error) {
-      throwIfAborted(options.signal);
-      if (isAbort2(error)) {
-        await delay(250, options.signal);
-        continue;
-      }
-      callbacks.status(`\u4E8C\u7EF4\u7801\u72B6\u6001\u67E5\u8BE2\u6682\u65F6\u5931\u8D25\uFF0C\u6B63\u5728\u91CD\u8BD5\uFF1A${String(error)}`);
-      await delay(1e3, options.signal);
-      continue;
-    }
-    switch (response.status) {
-      case "wait":
-        break;
-      case "scaned":
-        pendingVerifyCode = void 0;
-        if (!scanned) {
-          callbacks.status("\u4E8C\u7EF4\u7801\u5DF2\u626B\u63CF\uFF0C\u6B63\u5728\u7B49\u5F85\u5FAE\u4FE1\u786E\u8BA4\u3002");
-          scanned = true;
-        }
-        break;
-      case "need_verifycode":
-        pendingVerifyCode = await callbacks.readVerifyCode(
-          pendingVerifyCode === void 0 ? "\u8BF7\u8F93\u5165\u624B\u673A\u5FAE\u4FE1\u663E\u793A\u7684\u6570\u5B57\uFF1A" : "\u6570\u5B57\u4E0D\u5339\u914D\uFF0C\u8BF7\u91CD\u65B0\u8F93\u5165\uFF1A",
-          options.signal
-        );
-        continue;
-      case "scaned_but_redirect":
-        currentBaseUrl = redirectBaseUrl(response.redirect_host);
-        callbacks.status("\u5DF2\u5207\u6362\u5230\u5FAE\u4FE1\u5206\u914D\u7684\u8FDE\u63A5\u8282\u70B9\u3002");
-        break;
-      case "expired":
-      case "verify_code_blocked":
-        refreshes += 1;
-        if (refreshes >= MAX_QR_REFRESHES) {
-          throw new Error("\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u591A\u6B21\u5931\u6548\u6216\u9A8C\u8BC1\u7801\u591A\u6B21\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5");
-        }
-        pendingVerifyCode = void 0;
-        scanned = false;
-        qr = await fetchQr(options.existingTokens ?? [], fetchImpl, options.signal);
-        callbacks.status("\u4E8C\u7EF4\u7801\u5DF2\u5237\u65B0\uFF0C\u8BF7\u91CD\u65B0\u626B\u63CF\u3002");
-        await callbacks.showQr(qr.url);
-        break;
-      case "binded_redirect":
-        throw new Error("\u8FD9\u4E2A\u5FAE\u4FE1 ClawBot \u5DF2\u7ED1\u5B9A\u5176\u4ED6\u672C\u5730\u5B9E\u4F8B\uFF1B\u8BF7\u5728\u5FAE\u4FE1\u4E2D\u89E3\u9664\u65E7\u8FDE\u63A5\u540E\u91CD\u65B0\u626B\u7801");
-      case "confirmed": {
-        const token = response.bot_token?.trim();
-        const accountId = response.ilink_bot_id?.trim();
-        if (!token || !accountId) throw new Error("\u5FAE\u4FE1\u786E\u8BA4\u6210\u529F\uFF0C\u4F46\u670D\u52A1\u5668\u6CA1\u6709\u8FD4\u56DE\u5B8C\u6574\u767B\u5F55\u51ED\u636E");
-        const baseUrl = normalizeBaseUrl(response.baseurl?.trim() || currentBaseUrl);
-        callbacks.status("\u5FAE\u4FE1\u8FDE\u63A5\u6388\u6743\u6210\u529F\u3002");
-        return {
-          token,
-          accountId,
-          baseUrl,
-          ...response.ilink_user_id?.trim() ? { userId: response.ilink_user_id.trim() } : {}
-        };
-      }
-      default:
-        throw new Error(`\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u670D\u52A1\u5668\u8FD4\u56DE\u672A\u77E5\u72B6\u6001\uFF1A${String(response.status)}`);
-    }
-    await delay(1e3, options.signal);
-  }
-  throwIfAborted(options.signal);
-  throw new Error("\u5FAE\u4FE1\u626B\u7801\u767B\u5F55\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u542F\u52A8\u540E\u518D\u8BD5");
-}
-async function fetchQr(existingTokens, fetchImpl, signal) {
-  const response = await requestQrJson(
-    "POST",
-    `${FIXED_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`,
-    15e3,
-    { local_token_list: existingTokens.slice(-10).reverse() },
-    fetchImpl,
-    signal
-  );
-  const id = response.qrcode?.trim();
-  const url = response.qrcode_img_content?.trim();
-  if (!id || !url) throw new Error("\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u670D\u52A1\u5668\u6CA1\u6709\u8FD4\u56DE\u6709\u6548\u4E8C\u7EF4\u7801");
-  return { id, url };
-}
-function pollStatus(baseUrl, qrcode, verifyCode, timeoutMs, fetchImpl, signal) {
-  const query = new URLSearchParams({ qrcode });
-  if (verifyCode) query.set("verify_code", verifyCode);
-  return requestQrJson(
-    "GET",
-    `${baseUrl}/ilink/bot/get_qrcode_status?${query.toString()}`,
-    timeoutMs,
-    void 0,
-    fetchImpl,
-    signal
-  );
-}
-async function displayQr(url) {
-  try {
-    const qrcode = await import("qrcode-terminal");
-    qrcode.default.generate(url, { small: true });
-  } catch {
-  }
-  process.stdout.write(`\u4E8C\u7EF4\u7801\u5907\u7528\u94FE\u63A5\uFF08\u8BF7\u52FF\u8F6C\u53D1\uFF09\uFF1A
-${url}
-`);
-}
-async function readVerifyCode(prompt, signal) {
-  const input = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    return (await (signal === void 0 ? input.question(prompt) : input.question(prompt, { signal }))).trim();
-  } finally {
-    input.close();
-  }
-}
-function redirectBaseUrl(host) {
-  if (!host?.trim()) throw new Error("\u5FAE\u4FE1\u8981\u6C42\u5207\u6362\u8282\u70B9\uFF0C\u4F46\u6CA1\u6709\u8FD4\u56DE redirect_host");
-  if (!/^[A-Za-z0-9.-]+(?::\d+)?$/.test(host)) throw new Error("\u5FAE\u4FE1\u8FD4\u56DE\u7684 redirect_host \u683C\u5F0F\u65E0\u6548");
-  return normalizeBaseUrl(`https://${host}`);
-}
-function normalizeBaseUrl(value) {
-  const url = new URL(value);
-  if (url.protocol !== "https:") throw new Error("\u5FAE\u4FE1 iLink baseUrl \u5FC5\u987B\u4F7F\u7528 HTTPS");
-  return url.toString().replace(/\/+$/, "");
-}
-function isAbort2(error) {
-  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
-}
-function throwIfAborted(signal) {
-  if (!signal?.aborted) return;
-  if (signal.reason instanceof Error) throw signal.reason;
-  throw new Error(typeof signal.reason === "string" ? signal.reason : "\u5FAE\u4FE1\u626B\u7801\u767B\u5F55\u5DF2\u53D6\u6D88");
-}
-
 // src/markdown-filter.ts
 var StreamingMarkdownFilter = class _StreamingMarkdownFilter {
   buf = "";
@@ -1427,7 +909,7 @@ function filterMarkdownForWeixin(text) {
 // src/state.ts
 import { chmod, mkdir, open, readFile, rename, unlink } from "fs/promises";
 import { dirname } from "path";
-import { randomBytes as randomBytes3 } from "crypto";
+import { randomBytes } from "crypto";
 var SyncCursorStore = class {
   constructor(path) {
     this.path = path;
@@ -1448,7 +930,7 @@ var SyncCursorStore = class {
   async save(cursor) {
     const parent = dirname(this.path);
     await mkdir(parent, { recursive: true, mode: 448 });
-    const temporary = `${this.path}.${process.pid}.${randomBytes3(6).toString("hex")}.tmp`;
+    const temporary = `${this.path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     let committed = false;
     try {
       const handle = await open(temporary, "wx", 384);
@@ -1520,21 +1002,25 @@ var WeixinHarnessBridge = class {
   }
   /** Force QR login, replacing any connected credential after authorization succeeds. */
   async requestLogin(signal, displayQr2 = true) {
-    throwIfAborted2(signal);
+    throwIfAborted(signal);
     if (this.stopping) throw new Error("\u5FAE\u4FE1\u901A\u9053\u6B63\u5728\u505C\u6B62\uFF0C\u65E0\u6CD5\u53D1\u8D77\u626B\u7801");
     let attempt = this.connectionAttempt;
     if (attempt !== void 0 && displayQr2) attempt.displayQr = true;
     if (attempt?.qrUrl !== void 0) {
       if (displayQr2) await this.showQr(attempt.qrUrl);
-      return { kind: "qr-shown", reused: true, url: attempt.qrUrl };
+      return { kind: "qr-shown", reused: true, url: attempt.qrUrl, completion: attempt.task };
     }
     if (attempt === void 0) attempt = this.launchConnection(true, displayQr2);
     let readiness = await waitFor(attempt.ready, signal);
-    if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
+    if (readiness.kind === "qr") {
+      return { kind: "qr-shown", reused: false, url: readiness.url, completion: attempt.task };
+    }
     if (!attempt.forceQr && !this.stopping) {
       attempt = this.launchConnection(true, displayQr2);
       readiness = await waitFor(attempt.ready, signal);
-      if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
+      if (readiness.kind === "qr") {
+        return { kind: "qr-shown", reused: false, url: readiness.url, completion: attempt.task };
+      }
     }
     if (readiness.kind === "connected") throw new Error("\u5FAE\u4FE1\u91CD\u65B0\u767B\u5F55\u6D41\u7A0B\u6CA1\u6709\u8FD4\u56DE\u4E8C\u7EF4\u7801");
     throw readiness.error;
@@ -1558,14 +1044,15 @@ var WeixinHarnessBridge = class {
     const ready = new Promise((resolve) => {
       resolveReady = resolve;
     });
-    const attempt = {
+    let attempt;
+    const task = Promise.resolve().then(() => this.connect(forceQr, attempt));
+    attempt = {
       forceQr,
       ready,
       resolveReady,
       displayQr: displayQr2,
-      task: Promise.resolve()
+      task
     };
-    attempt.task = this.connect(forceQr, attempt);
     this.connectionAttempt = attempt;
     void attempt.task.then(
       () => {
@@ -1591,18 +1078,18 @@ var WeixinHarnessBridge = class {
   }
   async connect(forceQr, attempt) {
     const credential = await this.resolveCredential(forceQr, attempt);
-    throwIfAborted2(this.abortController.signal);
+    throwIfAborted(this.abortController.signal);
     await this.disconnectActive();
-    throwIfAborted2(this.abortController.signal);
+    throwIfAborted(this.abortController.signal);
     const api = this.apiFactory(credential, this.config);
     const conversations = new ConversationManager(this.ctx, this.config, credential.accountId);
     let notified = false;
     try {
       await conversations.initialize();
-      throwIfAborted2(this.abortController.signal);
+      throwIfAborted(this.abortController.signal);
       await api.notifyStart();
       notified = true;
-      throwIfAborted2(this.abortController.signal);
+      throwIfAborted(this.abortController.signal);
     } catch (error) {
       await Promise.allSettled([
         conversations.dispose(),
@@ -1622,6 +1109,7 @@ var WeixinHarnessBridge = class {
         this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
       }
     });
+    return credential;
   }
   async resolveCredential(forceQr, attempt) {
     const ref = credentialRef(this.config.credentialRef);
@@ -1646,7 +1134,7 @@ var WeixinHarnessBridge = class {
         status: (message) => this.log.info("%s", message)
       }
     });
-    throwIfAborted2(this.abortController.signal);
+    throwIfAborted(this.abortController.signal);
     await this.ctx.credentials.set(ref, JSON.stringify(credential));
     this.log.info("Weixin credential stored by the Harness credential provider");
     return credential;
@@ -1929,25 +1417,25 @@ function messageText(message) {
 }
 function resolveStatePath(configured, accountId) {
   if (configured) return configured;
-  const digest = createHash3("sha256").update(accountId).digest("hex").slice(0, 16);
+  const digest = createHash("sha256").update(accountId).digest("hex").slice(0, 16);
   return join(homedir(), ".dsh", "weixin", `${digest}.sync.json`);
 }
 function shortId2(value) {
   return value.length <= 12 ? value : value.slice(0, 12);
 }
-function throwIfAborted2(signal) {
+function throwIfAborted(signal) {
   if (!signal?.aborted) return;
   if (signal.reason instanceof Error) throw signal.reason;
   throw new Error(typeof signal.reason === "string" ? signal.reason : "\u64CD\u4F5C\u5DF2\u53D6\u6D88");
 }
 function waitFor(promise, signal) {
   if (signal === void 0) return promise;
-  throwIfAborted2(signal);
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const abort = () => {
       signal.removeEventListener("abort", abort);
       try {
-        throwIfAborted2(signal);
+        throwIfAborted(signal);
       } catch (error) {
         reject(error);
       }
@@ -2083,6 +1571,7 @@ export {
   formatApprovalPrompt,
   inboundContent,
   inject,
+  loginStandalone,
   loginWithQr,
   mountBridge,
   name,
@@ -2091,6 +1580,7 @@ export {
   requestLoginFromControlSocket,
   resolveControlSocketPath,
   sessionIdFor,
-  truncateUtf8
+  truncateUtf8,
+  waitForLoginFromControlSocket
 };
 //# sourceMappingURL=index.js.map

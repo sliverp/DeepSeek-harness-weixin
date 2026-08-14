@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-weixin",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Official Weixin iLink QR-login text and image bridge for DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",
@@ -52,6 +52,7 @@
     "url": "https://github.com/sliverp/DeepSeek-harness-weixin/issues"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-credentials-local": "0.1.0-rc.6",
     "@deepseek-ai/schemastery": "^3.18.1",
     "qrcode-terminal": "0.12.0"
   },
@@ -94,6 +95,6 @@
   "engines": {
     "node": ">=22.19"
   },
-  "packageManager": "pnpm@11.7.0",
+  "packageManager": "pnpm@10.33.4",
   "ilink_appid": "bot"
 }

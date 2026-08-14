@@ -29,8 +29,16 @@ export { detectImageMediaType, inboundContent } from './inbound.js'
 export { loginWithQr } from './login.js'
 export { filterMarkdownForWeixin, StreamingMarkdownFilter } from './markdown-filter.js'
 export { WeixinApiClient } from './protocol.js'
-export { defaultControlSocketPath, requestLoginFromControlSocket, resolveControlSocketPath, WeixinControlServer } from './control.js'
+export {
+  defaultControlSocketPath,
+  requestLoginFromControlSocket,
+  resolveControlSocketPath,
+  waitForLoginFromControlSocket,
+  WeixinControlServer,
+} from './control.js'
 export type { WeixinControlRequestOptions, WeixinControlResponse } from './control.js'
+export { loginStandalone } from './standalone-login.js'
+export type { StandaloneLoginOptions, StandaloneQrLogin } from './standalone-login.js'
 export { parseCredential } from './types.js'
 export { SeenMessageIds, sessionIdFor, truncateUtf8 } from './util.js'
 

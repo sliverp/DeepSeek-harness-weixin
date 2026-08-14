@@ -1,14 +1,19 @@
+import { randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { createConnection, createServer, type Server, type Socket } from 'node:net'
 import type { WeixinLoginRequest } from './bridge.js'
+import type { WeixinCredential } from './types.js'
 
 const MAX_CONTROL_MESSAGE_BYTES = 4_096
 const DEFAULT_CLIENT_TIMEOUT_MS = 30_000
+const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60_000
+const MAX_TRACKED_LOGINS = 32
 
 export type WeixinControlResponse =
-  | { ok: true; kind: 'qr'; reused: boolean; url: string }
+  | { ok: true; kind: 'qr'; reused: boolean; url: string; loginId?: string }
+  | { ok: true; kind: 'connected'; accountId: string; userId?: string; baseUrl: string }
   | { ok: false; error: string }
 
 export interface WeixinControlRequestOptions {
@@ -38,6 +43,8 @@ export class WeixinControlServer {
   private server: Server | undefined
   private startTask: Promise<void> | undefined
   private readonly clients = new Set<Socket>()
+  private readonly loginIds = new WeakMap<Promise<WeixinCredential>, string>()
+  private readonly loginCompletions = new Map<string, Promise<WeixinControlResponse>>()
   private ownsSocket = false
   private stopping = false
 
@@ -74,6 +81,7 @@ export class WeixinControlServer {
       await unlinkIfPresent(this.socketPath)
       this.ownsSocket = false
     }
+    this.loginCompletions.clear()
   }
 
   private async start(): Promise<void> {
@@ -141,11 +149,47 @@ export class WeixinControlServer {
     } catch {
       return { ok: false, error: 'invalid control request' }
     }
-    if (!isLoginRequest(request)) return { ok: false, error: 'unknown control command' }
-    // The control client owns presentation: the ordinary CLI renders the QR in
-    // its terminal, while --url prints only the returned URL.
-    const result = await this.requestLogin(signal, false)
-    return { ok: true, kind: 'qr', reused: result.reused, url: result.url }
+    if (isLoginRequest(request)) {
+      // The control client owns presentation: the ordinary CLI renders the QR
+      // locally, while --url writes only the returned URL.
+      const result = await this.requestLogin(signal, false)
+      return {
+        ok: true,
+        kind: 'qr',
+        reused: result.reused,
+        url: result.url,
+        loginId: this.trackLogin(result.completion),
+      }
+    }
+    if (isWaitLoginRequest(request)) {
+      const completion = this.loginCompletions.get(request.loginId)
+      if (completion === undefined) return { ok: false, error: 'unknown or expired login attempt' }
+      return waitFor(completion, signal)
+    }
+    return { ok: false, error: 'unknown control command' }
+  }
+
+  private trackLogin(completion: Promise<WeixinCredential>): string {
+    const existing = this.loginIds.get(completion)
+    if (existing !== undefined) return existing
+    const loginId = randomUUID()
+    this.loginIds.set(completion, loginId)
+    this.loginCompletions.set(loginId, completion.then<WeixinControlResponse, WeixinControlResponse>(
+      credential => ({
+        ok: true,
+        kind: 'connected',
+        accountId: credential.accountId,
+        ...(credential.userId === undefined ? {} : { userId: credential.userId }),
+        baseUrl: credential.baseUrl,
+      }),
+      error => ({ ok: false, error: renderError(error) }),
+    ))
+    while (this.loginCompletions.size > MAX_TRACKED_LOGINS) {
+      const oldest = this.loginCompletions.keys().next().value as string | undefined
+      if (oldest === undefined) break
+      this.loginCompletions.delete(oldest)
+    }
+    return loginId
   }
 
   private respond(socket: Socket, response: WeixinControlResponse): void {
@@ -161,11 +205,36 @@ export function requestLoginFromControlSocket(
 ): Promise<WeixinControlResponse> {
   if (!isAbsolute(socketPath)) return Promise.reject(new Error('control socket path must be absolute'))
   const resolvedOptions = typeof options === 'number' ? { timeoutMs: options } : options
+  return requestControl(
+    socketPath,
+    {
+      command: 'login',
+      ...(resolvedOptions.urlOnly === true ? { urlOnly: true } : {}),
+    },
+    resolvedOptions.timeoutMs ?? DEFAULT_CLIENT_TIMEOUT_MS,
+  )
+}
+
+/** Wait for one QR attempt to finish authorization and hot-switching. */
+export function waitForLoginFromControlSocket(
+  socketPath: string,
+  loginId: string,
+  timeoutMs = DEFAULT_WAIT_TIMEOUT_MS,
+): Promise<WeixinControlResponse> {
+  if (!loginId.trim()) return Promise.reject(new Error('login id must not be empty'))
+  return requestControl(socketPath, { command: 'wait-login', loginId }, timeoutMs)
+}
+
+function requestControl(
+  socketPath: string,
+  request: { command: 'login'; urlOnly?: boolean } | { command: 'wait-login'; loginId: string },
+  timeoutMs: number,
+): Promise<WeixinControlResponse> {
+  if (!isAbsolute(socketPath)) return Promise.reject(new Error('control socket path must be absolute'))
   return new Promise<WeixinControlResponse>((resolveResponse, rejectResponse) => {
     const socket = createConnection(socketPath)
     let input = ''
     let settled = false
-    const timeoutMs = resolvedOptions.timeoutMs ?? DEFAULT_CLIENT_TIMEOUT_MS
     const timer = setTimeout(() => settleError(new Error(`control request timed out after ${timeoutMs}ms`)), timeoutMs)
 
     const cleanup = (): void => {
@@ -187,10 +256,7 @@ export function requestLoginFromControlSocket(
     }
 
     socket.setEncoding('utf8')
-    socket.once('connect', () => socket.write(`${JSON.stringify({
-      command: 'login',
-      ...(resolvedOptions.urlOnly === true ? { urlOnly: true } : {}),
-    })}\n`))
+    socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`))
     socket.once('error', settleError)
     socket.on('data', chunk => {
       input += chunk
@@ -219,6 +285,13 @@ function isLoginRequest(value: unknown): value is { command: 'login'; urlOnly?: 
       || typeof (value as { urlOnly?: unknown }).urlOnly === 'boolean')
 }
 
+function isWaitLoginRequest(value: unknown): value is { command: 'wait-login'; loginId: string } {
+  return typeof value === 'object' && value !== null
+    && (value as { command?: unknown }).command === 'wait-login'
+    && typeof (value as { loginId?: unknown }).loginId === 'string'
+    && (value as { loginId: string }).loginId.length > 0
+}
+
 function parseControlResponse(value: unknown): WeixinControlResponse {
   if (typeof value !== 'object' || value === null) throw new Error('invalid control response')
   const response = value as Record<string, unknown>
@@ -226,10 +299,54 @@ function parseControlResponse(value: unknown): WeixinControlResponse {
     return { ok: false, error: response.error }
   }
   if (response.ok === true && response.kind === 'qr' && typeof response.url === 'string'
-    && typeof response.reused === 'boolean') {
-    return { ok: true, kind: 'qr', reused: response.reused, url: response.url }
+    && typeof response.reused === 'boolean'
+    && (response.loginId === undefined || typeof response.loginId === 'string')) {
+    return {
+      ok: true,
+      kind: 'qr',
+      reused: response.reused,
+      url: response.url,
+      ...(response.loginId === undefined ? {} : { loginId: response.loginId }),
+    }
+  }
+  if (response.ok === true && response.kind === 'connected'
+    && typeof response.accountId === 'string'
+    && (response.userId === undefined || typeof response.userId === 'string')
+    && typeof response.baseUrl === 'string') {
+    return {
+      ok: true,
+      kind: 'connected',
+      accountId: response.accountId,
+      ...(response.userId === undefined ? {} : { userId: response.userId }),
+      baseUrl: response.baseUrl,
+    }
   }
   throw new Error('invalid control response')
+}
+
+function waitFor<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal))
+  return new Promise<T>((resolveWait, rejectWait) => {
+    const abort = (): void => {
+      signal.removeEventListener('abort', abort)
+      rejectWait(abortReason(signal))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    void promise.then(
+      value => {
+        signal.removeEventListener('abort', abort)
+        resolveWait(value)
+      },
+      error => {
+        signal.removeEventListener('abort', abort)
+        rejectWait(error)
+      },
+    )
+  })
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('control client disconnected')
 }
 
 async function removeStaleSocket(socketPath: string): Promise<void> {
