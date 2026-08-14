@@ -11,6 +11,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     allowFrom: [],
     imageInputMode: 'auto',
     responseTimeoutMs: 1_000,
+    approvalTimeoutMs: 500,
     mediaDownloadTimeoutMs: 1_000,
     apiTimeoutMs: 1_000,
     longPollTimeoutMs: 1_000,

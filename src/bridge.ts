@@ -2,10 +2,13 @@ import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { parseApprovalCommand } from './approvals.js'
 import type { Config } from './config.js'
 import { ConversationManager, type ConversationReply } from './conversations.js'
 import { loginWithQr } from './login.js'
+import { filterMarkdownForWeixin } from './markdown-filter.js'
 import { WeixinApiClient, type WeixinApiPort } from './protocol.js'
 import { SyncCursorStore } from './state.js'
 import {
@@ -52,6 +55,9 @@ export class WeixinHarnessBridge {
     if (config.statePath && !isAbsolute(config.statePath)) {
       throw new Error(`weixin-channel: statePath must be absolute, got ${JSON.stringify(config.statePath)}`)
     }
+    if (config.approvalTimeoutMs >= config.responseTimeoutMs) {
+      throw new Error('weixin-channel: approvalTimeoutMs must be less than responseTimeoutMs')
+    }
     this.log = ctx.logger('deepseek-harness-weixin')
     this.seen = new SeenMessageIds(config.maxSeenMessageIds)
   }
@@ -77,6 +83,7 @@ export class WeixinHarnessBridge {
     if (this.stopping) return
     this.stopping = true
     this.abortController.abort()
+    this.conversations?.cancelPendingApprovals()
     if (this.monitorTask !== undefined) await this.monitorTask
     await Promise.allSettled(this.inFlight)
     if (this.conversations !== undefined) await this.conversations.dispose()
@@ -170,9 +177,15 @@ export class WeixinHarnessBridge {
 
   private async dispatch(message: WeixinMessage, api: WeixinApiPort): Promise<void> {
     if (message.message_type !== undefined && message.message_type !== MessageType.USER) return
-    if (!message.from_user_id?.trim() || !this.allowed(message.from_user_id)) return
+    const sender = message.from_user_id?.trim()
+    if (!sender || !this.allowed(sender)) return
     if (this.seen.hasOrAdd(messageKey(message))) return
-    while (this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
+    const command = commandText(message)
+    const bypassCapacity = command === '/bot-cancel'
+      || command === '/new'
+      || command === '/reset'
+      || parseApprovalCommand(command) !== undefined
+    while (!bypassCapacity && this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
       await Promise.race(this.inFlight)
     }
     if (this.stopping) return
@@ -190,6 +203,37 @@ export class WeixinHarnessBridge {
 
   private async handleMessage(message: WeixinMessage, api: WeixinApiPort): Promise<void> {
     const command = commandText(message)
+    const approvalCommand = parseApprovalCommand(command)
+    if (approvalCommand === 'invalid') {
+      await this.sendReply(message, api, {
+        text: '审批命令格式不正确。请回复 /approve 123456 或 /reject 123456。',
+        images: [],
+      })
+      return
+    }
+    if (approvalCommand !== undefined) {
+      const resolved = this.requireConversations().decideApproval(message, approvalCommand)
+      const text = resolved === undefined
+        ? `没有找到待处理的审批 ${approvalCommand.code}；它可能已完成、取消或超时。`
+        : resolved.outcome === 'allowed-once'
+          ? `已批准 ${resolved.toolName}（${resolved.code}），正在继续执行。`
+          : `已拒绝 ${resolved.toolName}（${resolved.code}）。`
+      await this.sendReply(message, api, { text, images: [] })
+      return
+    }
+    if (command === '/new' || command === '/reset') {
+      try {
+        await this.requireConversations().startNewConversation(message)
+        await this.sendReply(message, api, {
+          text: '已开始新的 Harness 会话；旧 session 已保留，可继续在 Web 中查看。',
+          images: [],
+        })
+      } catch (error) {
+        this.log.error('Weixin new-session command failed: %s', String(error))
+        await this.sendReply(message, api, { text: '创建新的 Harness 会话失败，请稍后重试。', images: [] })
+      }
+      return
+    }
     if (command === '/bot-ping') {
       await this.sendReply(message, api, { text: 'pong — DeepSeek Harness 微信机器人已连接。', images: [] })
       return
@@ -202,6 +246,10 @@ export class WeixinHarnessBridge {
           '/bot-image-test — 发送蓝色图片，检查图片链路',
           '/bot-status — 查看当前连接状态',
           '/bot-cancel — 取消当前生成',
+          '/new 或 /reset — 保留旧 session 并开始新会话',
+          '/approve 123456 — 批准一次待处理工具调用',
+          '/reject 123456 — 拒绝一次待处理工具调用',
+          'Harness 注册的斜杠命令会直接交给命令运行时，不会发送给模型。',
           '其他消息会交给当前 Harness 默认模型处理。',
         ].join('\n'),
         images: [],
@@ -231,8 +279,44 @@ export class WeixinHarnessBridge {
       return
     }
 
+    const slashLine = messageText(message)
+    if (parseCommand(slashLine) !== undefined) {
+      try {
+        const outcome = await this.requireConversations().executeCommand(
+          message,
+          slashLine,
+          api,
+          text => this.sendTextReply(message, api, text),
+        )
+        if (outcome.kind === 'handled') {
+          await this.sendReply(message, api, outcome.reply)
+        } else {
+          const available = ['/new', '/reset', ...outcome.available]
+          await this.sendReply(message, api, {
+            text: `未知命令 ${JSON.stringify(slashLine.split(/\s/u, 1)[0])}。可用命令：${available.join('、') || '无'}。`,
+            images: [],
+          })
+        }
+      } catch (error) {
+        this.log.error('Weixin Harness command failed: %s', String(error))
+        await this.sendReply(message, api, { text: '执行 Harness 命令时发生错误，请稍后重试。', images: [] })
+      }
+      return
+    }
+    if (slashLine.startsWith('/')) {
+      await this.sendReply(message, api, {
+        text: '斜杠命令格式不正确；命令名只能使用小写字母、数字、下划线或连字符。',
+        images: [],
+      })
+      return
+    }
+
     try {
-      const reply = await this.requireConversations().process(message, api)
+      const reply = await this.requireConversations().process(
+        message,
+        api,
+        text => this.sendTextReply(message, api, text),
+      )
       await this.sendReply(message, api, reply)
     } catch (error) {
       this.log.error('Weixin message processing failed: %s', String(error))
@@ -248,13 +332,24 @@ export class WeixinHarnessBridge {
     const to = message.from_user_id?.trim()
     if (!to) throw new Error('Weixin reply has no target user')
     const images = reply.images.slice(0, this.config.maxReplyImages)
-    const text = truncateUtf8(reply.text || (images.length === 0 ? '处理完成。' : ''), this.config.maxReplyBytes)
+    const filteredText = filterMarkdownForWeixin(reply.text)
+    const text = truncateUtf8(
+      filteredText.trim() ? filteredText : (images.length === 0 ? '处理完成。' : ''),
+      this.config.maxReplyBytes,
+    )
     if (text) {
-      await this.retry(() => api.sendText(to, text, message.context_token))
+      await this.sendTextReply(message, api, text)
     }
     for (const image of images) {
       await this.retry(() => api.sendImage(to, image.data, message.context_token))
     }
+  }
+
+  private async sendTextReply(message: WeixinMessage, api: WeixinApiPort, text: string): Promise<void> {
+    const to = message.from_user_id?.trim()
+    if (!to) throw new Error('Weixin reply has no target user')
+    const bounded = truncateUtf8(text, this.config.maxReplyBytes)
+    if (bounded) await this.retry(() => api.sendText(to, bounded, message.context_token))
   }
 
   private async retry<T>(operation: () => Promise<T>): Promise<T> {
@@ -277,12 +372,15 @@ export class WeixinHarnessBridge {
 }
 
 function commandText(message: WeixinMessage): string {
+  return messageText(message).toLowerCase()
+}
+
+function messageText(message: WeixinMessage): string {
   return (message.item_list ?? [])
     .filter(item => item.type === MessageItemType.TEXT)
     .map(item => item.text_item?.text ?? '')
     .join('\n')
     .trim()
-    .toLowerCase()
 }
 
 function resolveStatePath(configured: string, accountId: string): string {

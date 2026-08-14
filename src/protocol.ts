@@ -13,8 +13,8 @@ import {
 } from './types.js'
 import { generateClientId } from './util.js'
 
-const CHANNEL_VERSION = '0.1.0'
-const BOT_AGENT = 'DeepSeek-Harness/0.1.0'
+const CHANNEL_VERSION = '0.2.0'
+const BOT_AGENT = 'DeepSeek-Harness/0.2.0'
 const ILINK_APP_ID = 'bot'
 // Protocol compatibility level of Tencent/openclaw-weixin v2.4.6.
 const ILINK_APP_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6

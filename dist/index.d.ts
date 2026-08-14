@@ -1,6 +1,7 @@
 import * as z from '@deepseek-ai/schemastery';
 import z__default from '@deepseek-ai/schemastery';
 import { Context } from '@deepseek-ai/cordis';
+import { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval';
 import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 import { ContentBlock } from '@deepseek-ai/dsh-llm';
 
@@ -12,12 +13,15 @@ type ImageInputMode = 'auto' | 'always' | 'never';
 interface Config {
     credentialRef: string;
     cwd: string;
+    agentPreset?: string;
+    permissionPreset?: string;
     statePath: string;
     autoLogin: boolean;
     accessPolicy: AccessMode;
     allowFrom: string[];
     imageInputMode: ImageInputMode;
     responseTimeoutMs: number;
+    approvalTimeoutMs: number;
     mediaDownloadTimeoutMs: number;
     apiTimeoutMs: number;
     longPollTimeoutMs: number;
@@ -198,14 +202,117 @@ declare class WeixinHarnessBridge {
     private allowed;
     private handleMessage;
     private sendReply;
+    private sendTextReply;
     private retry;
     private requireConversations;
 }
+
+/** A decision command intercepted by the Weixin channel. */
+interface ApprovalCommand {
+    code: string;
+    outcome: Extract<ApprovalOutcome, 'allowed-once' | 'rejected'>;
+}
+/** Result returned after resolving one pending approval. */
+interface ResolvedApproval {
+    code: string;
+    outcome: ApprovalCommand['outcome'];
+    toolName: string;
+}
+/** Parse an approval command; `invalid` prevents malformed commands from reaching the model. */
+declare function parseApprovalCommand(text: string): ApprovalCommand | 'invalid' | undefined;
+/** Owns the short-lived mapping between Harness approval requests and Weixin reply commands. */
+declare class WeixinApprovalRegistry {
+    private readonly timeoutMs;
+    private readonly pending;
+    constructor(timeoutMs: number);
+    /** Ask one Weixin user and await a one-shot Harness approval outcome. */
+    request(conversationId: string, request: ApprovalRequest, sendPrompt: (text: string) => Promise<void>): Promise<ApprovalOutcome>;
+    /** Resolve a pending request only when the command came from its originating conversation. */
+    decide(conversationId: string, command: ApprovalCommand): ResolvedApproval | undefined;
+    /** Cancel every pending request for one conversation. */
+    cancelConversation(conversationId: string): boolean;
+    /** Cancel every pending request during channel teardown. */
+    cancelAll(): void;
+    private createCode;
+}
+/** Render the exact structured tool call linked by the approval request when available. */
+declare function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number): string;
+
+/** Completed response from one Weixin-triggered Harness turn. */
+interface ConversationReply {
+    text: string;
+    images: Array<{
+        data: Uint8Array;
+        mediaType: string;
+        name?: string;
+    }>;
+}
+/** Result of dispatching one syntactically valid Harness slash command. */
+type ConversationCommandOutcome = {
+    kind: 'handled';
+    reply: ConversationReply;
+} | {
+    kind: 'unknown';
+    available: string[];
+};
 
 /** Build durable DSH content blocks from one official Weixin message. */
 declare function inboundContent(ctx: Context, config: Config, api: WeixinApiPort, message: WeixinMessage, includeImages?: boolean): Promise<ContentBlock[]>;
 /** Detect image formats accepted by Harness attachments from magic bytes. */
 declare function detectImageMediaType(data: Uint8Array): ImageMediaType;
+
+/**
+ * Adapted from Tencent/openclaw-weixin v2.4.6's StreamingMarkdownFilter
+ * at commit cef0bfc390393f716903e16d50408118047f87e0.
+ * The upstream implementation is MIT-licensed; see this package's LICENSE.
+ */
+/**
+ * Streaming markdown filter — character-level state machine that strips
+ * unsupported markdown syntax on-the-fly.
+ *
+ * Outputs as much filtered text as possible on each `feed()` call, only
+ * holding back the minimum characters needed for pattern disambiguation
+ * (e.g. a trailing `*` that might become `***`).
+ *
+ * Constructs passed through (not filtered):
+ * - Code fences (```)
+ * - Inline code (`)
+ * - Tables (|...|)
+ * - Horizontal rules (---, ***, ___)
+ * - Bold (**)
+ * - Italic/bold-italic wrapping non-CJK content
+ *
+ * Constructs filtered (markers stripped, content kept):
+ * - Italic/bold-italic wrapping CJK content
+ * - Headings H5/H6 (#####, ######)
+ * - Images (![alt](url)) — removed entirely
+ *
+ * States:
+ * - **sol** (start-of-line): checks for line-start patterns (```, >, #####, indent)
+ * - **body**: scans for inline patterns (![, ~~, ***) and outputs safe chars
+ * - **fence**: inside a fenced code block, passes through until closing ```
+ * - **inline**: accumulating content inside an inline marker pair
+ */
+declare class StreamingMarkdownFilter {
+    private buf;
+    private fence;
+    private sol;
+    private inl;
+    feed(delta: string): string;
+    flush(): string;
+    private pump;
+    /** Inside a code fence: pass content and markers through verbatim. */
+    private pumpFence;
+    /** At start of line: detect and consume line-start patterns, then transition to body. */
+    private pumpSOL;
+    /** Scan line body for inline pattern triggers; output safe chars eagerly. */
+    private pumpBody;
+    /** Accumulate inline content until closing marker is found. */
+    private pumpInline;
+    private static containsCJK;
+}
+/** Filter one complete Harness reply to the Markdown subset rendered by Weixin. */
+declare function filterMarkdownForWeixin(text: string): string;
 
 /** Deterministic, non-identifying DSH session id for one Weixin user. */
 declare function sessionIdFor(accountId: string, message: Pick<WeixinMessage, 'from_user_id'>): string;
@@ -232,4 +339,4 @@ declare const _default: {
     apply: typeof apply;
 };
 
-export { Config, Config as ConfigType, SeenMessageIds, WeixinApiClient, WeixinHarnessBridge, apply, _default as default, detectImageMediaType, inboundContent, inject, loginWithQr, name, parseCredential, sessionIdFor, truncateUtf8 };
+export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, WeixinHarnessBridge, apply, _default as default, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginWithQr, name, parseApprovalCommand, parseCredential, sessionIdFor, truncateUtf8 };

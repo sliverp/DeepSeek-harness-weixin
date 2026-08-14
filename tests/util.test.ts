@@ -6,7 +6,7 @@ describe('Weixin utilities', () => {
     const first = sessionIdFor('account', { from_user_id: 'weixin-user-secret' })
     const second = sessionIdFor('account', { from_user_id: 'weixin-user-secret' })
     expect(first).toBe(second)
-    expect(first).toMatch(/^weixin-v1-single-[0-9a-f]{32}$/)
+    expect(first).toMatch(/^weixin-v3-single-[0-9a-f]{32}$/)
     expect(first).not.toContain('weixin-user-secret')
   })
 

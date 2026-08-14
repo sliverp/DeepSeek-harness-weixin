@@ -4,4 +4,5 @@
       config:
         credentialRef: WEIXIN_ILINK_CREDENTIAL
         cwd: !!js process.env.DSH_WEIXIN_CWD ?? process.cwd()
+        permissionPreset: workspace-write
         statePath: !!js process.env.DSH_WEIXIN_STATE_PATH ?? ''

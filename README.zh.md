@@ -12,11 +12,15 @@
 - 登录令牌由 Harness 凭据服务保存，不进入插件配置。
 - 长轮询游标原子持久化，重启后继续消费。
 - 每个微信用户对应一个持久 Harness 会话。
+- 完整接入 Harness Agent preset 生命周期、结构化工具执行和 Web live session 复用。
 - 接收文字、语音转写、引用上下文和 AES 加密图片。
 - 发送文字，并通过微信 CDN 加密上传图片。
+- 出站文字支持与腾讯插件一致的部分 Markdown 渲染。
 - 当前模型不支持视觉时，自动保存图片并降级为附件说明。
 - 支持允许名单、禁用策略、有界并发、去重、重试和完整清理。
 - 内置 `/bot-ping`、`/bot-help`、`/bot-status`、`/bot-image-test`、`/bot-cancel`。
+- 工具请求审批时，可在同一微信会话用 `/approve <短码>` 或 `/reject <短码>` 决定。
+- `/new`、`/reset` 创建新的持久 session；其他 Harness 斜杠命令直接进入命令运行时。
 
 腾讯当前的 ClawBot/iLink 接入仅支持私聊。
 
@@ -32,12 +36,16 @@
 
 ## 安装
 
-把 Release 安装到 Harness 配置中：
+直接从 GitHub 安装到 `web` profile：
 
 ```sh
-pnpm dsh plugin --profile web add \
-  https://github.com/sliverp/DeepSeek-harness-weixin/releases/download/v0.1.0/deepseek-harness-weixin-0.1.0.tgz
-pnpm dsh --profile web
+pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
+```
+
+安装只会更新 profile。服务尚未运行时用下面的命令启动；已经运行则重启：
+
+```sh
+pnpm dsh web
 ```
 
 首次启动时，插件会在终端显示二维码和一个短期有效的备用链接。用手机微信扫码并确认连接。如果微信显示数字验证码，在同一个终端输入该数字。服务器签发的凭据会通过 `ctx.credentials` 保存到 `WEIXIN_ILINK_CREDENTIAL`；后续启动不需要再次扫码。
@@ -65,10 +73,14 @@ pnpm dsh --profile web
   config:
     credentialRef: WEIXIN_ILINK_CREDENTIAL
     cwd: /absolute/path/the-agent-may-work-in
+    agentPreset: standard
+    permissionPreset: workspace-write
     statePath: /absolute/path/weixin-sync.json
     accessPolicy: allowlist
     allowFrom: [your-ilink-user-id]
     imageInputMode: auto
+    responseTimeoutMs: 300000
+    approvalTimeoutMs: 240000
     maxInFlightMessages: 8
     maxReplyImages: 4
 ```
@@ -76,6 +88,36 @@ pnpm dsh --profile web
 `statePath` 为空时，游标默认保存在 `~/.dsh/weixin/`，并以原子写入和 `0600` 文件权限保护。
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
+
+`agentPreset` 可省略，默认采用 Harness preset roster 当前的默认项。新 session 会把最终解析出的 preset 记录到 header；恢复持久 session 时会采用该 session 记录的 preset（包括后续的 `agent-preset/selected` 事件）。只有完全没有 preset 记录的旧 session 才会明确回退到当前配置或默认 preset。同一 session 已经被 Web 加载时，微信通道会复用该 live Agent，不会启动第二个 writer。
+
+`permissionPreset` 可省略。配置后会先通过 `ctx.permissionPresets` 校验，并且只在创建新的通道 session 时写入；恢复持久 session 或借用 live Agent 时会保留该 session 已记录的权限。Harness Agent Loop 发出 `approval/request` 时，插件会把结构化 `tool/call` 中的工具名和命令发送到发起该回合的微信会话，例如：
+
+```text
+Bash 请求执行：ls -la
+回复 /approve 123456 或 /reject 123456
+该审批将在 240 秒后失效。
+```
+
+只有同一微信会话中的匹配短码有效；每个短码只能决定一次。批准会向 Harness 返回 `allowed-once`，拒绝返回 `rejected`，超时、发送失败、取消或服务退出则按不可用/已取消闭合。`approvalTimeoutMs` 必须小于 `responseTimeoutMs`，以便审批后 Agent Loop 还有时间执行工具并生成最终回复。审批命令不受普通消息的并发上限阻塞。
+
+本 checkout 使用 `workspace-write`。当前主机没有可用的本地沙箱后端时，Bash 可能请求一次性升级到 `danger-full-access`；只有明确回复对应的 `/approve` 后才会执行。批准这类升级意味着该次工具调用不受文件沙箱约束，因此必须保持 `allowFrom` 足够严格并在批准前检查命令。
+
+## Agent Loop 修复后的旧 session 处理
+
+session ID namespace 已升级为 `weixin-v3-single-...`。已有 `weixin-v1-single-...` 和 `weixin-v2-single-...` session 都不会被删除或改写，仍可在 Web 中查看。微信通道不再恢复 v1，因为其中可能已经把工具调用载体保存成普通 assistant 文本；也不再恢复 v2，因为文字审批接入前发起的审批可能留下未闭合 turn。升级后从微信发送第一条消息时会创建干净的 v3 session。每次 `/new` 或 `/reset` 会切换到后缀为 `-new-N` 的新 session；旧日志保持原样，服务重启后会继续编号最大的最新 session。
+
+## 斜杠命令
+
+`/new` 和 `/reset` 由微信通道处理：如当前 Agent 正在运行，会先取消并等待其闭合，然后创建新的持久 Harness session。旧 session 不会删除，仍可在 Web 中恢复或查看。
+
+其他语法合法的斜杠命令会调用 `ctx.commands.execute(agent, line, signal)`，而不是作为用户文字交给模型；因此会产生 Harness 原生的 `command/run` 和 `command/done` 事件。实际命令目录取决于当前 Harness 组合，通常包括 `/plan`、`/compact`、`/permission`、`/goal`、`/feedback` 和 `/export`。未知或格式错误的斜杠命令会直接返回命令提示，同样不会进入模型。
+
+## Markdown 兼容性
+
+iLink 协议的出站文字只是普通 `text_item.text` 字符串，不存在独立的富文本消息类型。发送前，本插件会采用[腾讯 `openclaw-weixin` 2.4.6](https://github.com/Tencent/openclaw-weixin/blob/cef0bfc390393f716903e16d50408118047f87e0/src/messaging/markdown-filter.ts) 相同的部分 Markdown 过滤策略：保留代码块、行内代码、表格、列表、引用、分隔线、H1-H4 标题、粗体、删除线和非 CJK 斜体标记；微信不支持的 CJK 斜体/粗斜体标记以及 H5-H6 标记会被移除，但正文保留。Markdown 图片引用会被移除，因为 Harness 图片块会改走 AES 加密的微信 CDN 媒体链路。
+
+这是针对微信显示能力的部分兼容，不等同于完整 CommonMark 或 HTML 渲染。
 
 ## 验证
 
@@ -86,6 +128,8 @@ pong — DeepSeek Harness 微信机器人已连接。
 ```
 
 发送 `/bot-image-test` 可以独立验证 AES 加密、微信 CDN 上传和图片投递，不依赖模型生成图片。然后再发送普通文字和一张照片，验证 Harness 模型链路。
+
+工具审批可发送“我当前有啥文件？”验证。收到 `Bash 请求执行：...` 后，原样回复其中的 `/approve <短码>`；插件应先确认批准，随后只发送工具执行后的最终文件列表。回复 `/reject <短码>` 则拒绝该次调用。
 
 ## 重新登录
 

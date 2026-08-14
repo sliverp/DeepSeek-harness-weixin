@@ -10,12 +10,15 @@ export type ImageInputMode = 'auto' | 'always' | 'never'
 export interface Config {
   credentialRef: string
   cwd: string
+  agentPreset?: string
+  permissionPreset?: string
   statePath: string
   autoLogin: boolean
   accessPolicy: AccessMode
   allowFrom: string[]
   imageInputMode: ImageInputMode
   responseTimeoutMs: number
+  approvalTimeoutMs: number
   mediaDownloadTimeoutMs: number
   apiTimeoutMs: number
   longPollTimeoutMs: number
@@ -37,12 +40,15 @@ export interface Config {
 export const Config: z<Config> = z.object({
   credentialRef: z.string().default('WEIXIN_ILINK_CREDENTIAL'),
   cwd: z.string().required(),
+  agentPreset: z.string(),
+  permissionPreset: z.string(),
   statePath: z.string().default(''),
   autoLogin: z.boolean().default(true),
   accessPolicy: z.union(['open', 'allowlist', 'disabled']).default('open'),
   allowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
   responseTimeoutMs: z.number().step(1).min(1).default(300_000),
+  approvalTimeoutMs: z.number().step(1).min(1_000).default(240_000),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(30_000),
   apiTimeoutMs: z.number().step(1).min(1).default(15_000),
   longPollTimeoutMs: z.number().step(1).min(1_000).default(35_000),
@@ -59,7 +65,7 @@ export const Config: z<Config> = z.object({
   maxSeenMessageIds: z.number().step(1).min(100).max(100_000).default(5_000),
   systemPrompt: z.string().default(
     'You are replying through Weixin. Keep replies clear and suitable for private chat. '
-    + 'Do not reveal credentials, context tokens, or internal system data. When a request needs an interactive approval '
-    + 'that Weixin cannot provide, explain what approval is needed instead of waiting indefinitely.',
+    + 'Do not reveal credentials, context tokens, or internal system data. Interactive tool approvals are routed to '
+    + 'the same Weixin user through /approve and /reject commands; wait for the recorded decision and never fabricate one.',
   ),
 })

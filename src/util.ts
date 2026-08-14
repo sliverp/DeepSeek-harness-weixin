@@ -1,12 +1,15 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { WeixinMessage } from './types.js'
 
+// v1 may contain unparsed tool-call text; v2 may contain an open approval turn from an interactive policy.
+const SESSION_NAMESPACE = 'weixin-v3-single'
+
 /** Deterministic, non-identifying DSH session id for one Weixin user. */
 export function sessionIdFor(accountId: string, message: Pick<WeixinMessage, 'from_user_id'>): string {
   const userId = message.from_user_id?.trim()
   if (!userId) throw new Error('Weixin message has no sender identifier')
   const digest = createHash('sha256').update(`${accountId}\0${userId}`).digest('hex').slice(0, 32)
-  return `weixin-v1-single-${digest}`
+  return `${SESSION_NAMESPACE}-${digest}`
 }
 
 /** Bound UTF-8 text without splitting a code point. */

@@ -2,66 +2,20 @@
 import { createHash as createHash3 } from "crypto";
 import { homedir } from "os";
 import { isAbsolute, join } from "path";
+import { parseCommand as parseCommand2 } from "@deepseek-ai/dsh-commands";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
-// src/conversations.ts
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { SessionId } from "@deepseek-ai/dsh-session";
-
-// src/types.ts
-var UploadMediaType = { IMAGE: 1, VIDEO: 2, FILE: 3, VOICE: 4 };
-var MessageItemType = {
-  NONE: 0,
-  TEXT: 1,
-  IMAGE: 2,
-  VOICE: 3,
-  FILE: 4,
-  VIDEO: 5
-};
-var MessageType = { NONE: 0, USER: 1, BOT: 2 };
-var MessageState = { NEW: 0, GENERATING: 1, FINISH: 2 };
-function parseCredential(value) {
-  let parsed;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error("weixin-channel: managed credential is not valid JSON");
-  }
-  if (parsed === null || typeof parsed !== "object") {
-    throw new Error("weixin-channel: managed credential must be a JSON object");
-  }
-  const data = parsed;
-  if (typeof data.token !== "string" || data.token.trim() === "") {
-    throw new Error("weixin-channel: managed credential has no token");
-  }
-  if (typeof data.accountId !== "string" || data.accountId.trim() === "") {
-    throw new Error("weixin-channel: managed credential has no accountId");
-  }
-  if (typeof data.baseUrl !== "string" || !isHttpsUrl(data.baseUrl)) {
-    throw new Error("weixin-channel: managed credential baseUrl must be an HTTPS URL");
-  }
-  return {
-    token: data.token.trim(),
-    accountId: data.accountId.trim(),
-    baseUrl: data.baseUrl.replace(/\/+$/, ""),
-    ...typeof data.userId === "string" && data.userId.trim() ? { userId: data.userId.trim() } : {}
-  };
-}
-function isHttpsUrl(value) {
-  try {
-    return new URL(value).protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+// src/approvals.ts
+import { randomInt } from "crypto";
 
 // src/util.ts
 import { createHash, randomBytes } from "crypto";
+var SESSION_NAMESPACE = "weixin-v3-single";
 function sessionIdFor(accountId, message) {
   const userId = message.from_user_id?.trim();
   if (!userId) throw new Error("Weixin message has no sender identifier");
   const digest = createHash("sha256").update(`${accountId}\0${userId}`).digest("hex").slice(0, 32);
-  return `weixin-v1-single-${digest}`;
+  return `${SESSION_NAMESPACE}-${digest}`;
 }
 function truncateUtf8(text, maxBytes, suffix = "\n\n[\u56DE\u590D\u5DF2\u622A\u65AD]") {
   const normalized = text.trim();
@@ -129,6 +83,172 @@ function messageKey(message) {
 }
 function generateClientId() {
   return `dsh-weixin:${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
+// src/approvals.ts
+function parseApprovalCommand(text) {
+  const trimmed = text.trim();
+  if (!/^\/(?:approve|reject)(?:\s|$)/i.test(trimmed)) return void 0;
+  const match = /^\/(approve|reject)\s+([0-9]{6})$/i.exec(trimmed);
+  if (match === null) return "invalid";
+  return {
+    code: match[2],
+    outcome: match[1]?.toLowerCase() === "approve" ? "allowed-once" : "rejected"
+  };
+}
+var WeixinApprovalRegistry = class {
+  constructor(timeoutMs) {
+    this.timeoutMs = timeoutMs;
+  }
+  timeoutMs;
+  pending = /* @__PURE__ */ new Map();
+  /** Ask one Weixin user and await a one-shot Harness approval outcome. */
+  async request(conversationId, request, sendPrompt) {
+    if (request.signal?.aborted) return "cancelled";
+    const code = this.createCode(conversationId);
+    const key = approvalKey(conversationId, code);
+    const decision = Promise.withResolvers();
+    let settled = false;
+    let timer;
+    const onAbort = () => {
+      pending.finish("cancelled");
+    };
+    const pending = {
+      code,
+      conversationId,
+      toolName: request.toolName,
+      finish: (outcome) => {
+        if (settled) return false;
+        settled = true;
+        this.pending.delete(key);
+        if (timer !== void 0) clearTimeout(timer);
+        request.signal?.removeEventListener("abort", onAbort);
+        decision.resolve(outcome);
+        return true;
+      }
+    };
+    this.pending.set(key, pending);
+    timer = setTimeout(() => pending.finish("unavailable"), this.timeoutMs);
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      await sendPrompt(formatApprovalPrompt(request, code, this.timeoutMs));
+    } catch {
+      pending.finish("unavailable");
+    }
+    return decision.promise;
+  }
+  /** Resolve a pending request only when the command came from its originating conversation. */
+  decide(conversationId, command) {
+    const pending = this.pending.get(approvalKey(conversationId, command.code));
+    if (pending === void 0 || !pending.finish(command.outcome)) return void 0;
+    return {
+      code: pending.code,
+      outcome: command.outcome,
+      toolName: pending.toolName
+    };
+  }
+  /** Cancel every pending request for one conversation. */
+  cancelConversation(conversationId) {
+    let cancelled = false;
+    for (const pending of [...this.pending.values()]) {
+      if (pending.conversationId !== conversationId) continue;
+      cancelled = pending.finish("cancelled") || cancelled;
+    }
+    return cancelled;
+  }
+  /** Cancel every pending request during channel teardown. */
+  cancelAll() {
+    for (const pending of [...this.pending.values()]) pending.finish("cancelled");
+  }
+  createCode(conversationId) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const code = String(randomInt(1e5, 1e6));
+      if (!this.pending.has(approvalKey(conversationId, code))) return code;
+    }
+    throw new Error("weixin-channel: could not allocate a unique approval code");
+  }
+};
+function formatApprovalPrompt(request, code, timeoutMs) {
+  const toolName = request.toolName.toLowerCase() === "bash" ? "Bash" : request.toolName;
+  const detail = approvalDetail(request);
+  return [
+    `${toolName} \u8BF7\u6C42\u6267\u884C\uFF1A${detail}`,
+    `\u56DE\u590D /approve ${code} \u6216 /reject ${code}`,
+    `\u8BE5\u5BA1\u6279\u5C06\u5728 ${Math.ceil(timeoutMs / 1e3)} \u79D2\u540E\u5931\u6548\u3002`
+  ].join("\n");
+}
+function approvalDetail(request) {
+  const call = request.callId === void 0 ? void 0 : [...request.agent.session.events].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
+  if (call?.type === "tool/call") {
+    try {
+      const parsed = JSON.parse(call.data.arguments);
+      if (isRecord(parsed) && typeof parsed.command === "string" && parsed.command.trim()) {
+        return truncateUtf8(parsed.command, 2e3, "\n[\u547D\u4EE4\u5DF2\u622A\u65AD]");
+      }
+    } catch {
+    }
+    if (call.data.arguments.trim()) return truncateUtf8(call.data.arguments, 2e3, "\n[\u53C2\u6570\u5DF2\u622A\u65AD]");
+  }
+  return truncateUtf8(request.reason?.trim() || "\u672A\u63D0\u4F9B\u64CD\u4F5C\u8BF4\u660E\u3002", 2e3, "\n[\u8BF4\u660E\u5DF2\u622A\u65AD]");
+}
+function approvalKey(conversationId, code) {
+  return `${conversationId}\0${code}`;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// src/conversations.ts
+import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
+import { parseCommand } from "@deepseek-ai/dsh-commands";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { SessionId } from "@deepseek-ai/dsh-session";
+
+// src/types.ts
+var UploadMediaType = { IMAGE: 1, VIDEO: 2, FILE: 3, VOICE: 4 };
+var MessageItemType = {
+  NONE: 0,
+  TEXT: 1,
+  IMAGE: 2,
+  VOICE: 3,
+  FILE: 4,
+  VIDEO: 5
+};
+var MessageType = { NONE: 0, USER: 1, BOT: 2 };
+var MessageState = { NEW: 0, GENERATING: 1, FINISH: 2 };
+function parseCredential(value) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("weixin-channel: managed credential is not valid JSON");
+  }
+  if (parsed === null || typeof parsed !== "object") {
+    throw new Error("weixin-channel: managed credential must be a JSON object");
+  }
+  const data = parsed;
+  if (typeof data.token !== "string" || data.token.trim() === "") {
+    throw new Error("weixin-channel: managed credential has no token");
+  }
+  if (typeof data.accountId !== "string" || data.accountId.trim() === "") {
+    throw new Error("weixin-channel: managed credential has no accountId");
+  }
+  if (typeof data.baseUrl !== "string" || !isHttpsUrl(data.baseUrl)) {
+    throw new Error("weixin-channel: managed credential baseUrl must be an HTTPS URL");
+  }
+  return {
+    token: data.token.trim(),
+    accountId: data.accountId.trim(),
+    baseUrl: data.baseUrl.replace(/\/+$/, ""),
+    ...typeof data.userId === "string" && data.userId.trim() ? { userId: data.userId.trim() } : {}
+  };
+}
+function isHttpsUrl(value) {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 // src/inbound.ts
@@ -212,25 +332,59 @@ var ConversationManager = class {
     this.ctx = ctx;
     this.config = config;
     this.accountId = accountId;
+    this.approvals = new WeixinApprovalRegistry(config.approvalTimeoutMs);
   }
   ctx;
   config;
   accountId;
-  handles = /* @__PURE__ */ new Map();
+  bindings = /* @__PURE__ */ new Map();
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
+  activeIds = /* @__PURE__ */ new Map();
+  rotations = /* @__PURE__ */ new Map();
+  approvals;
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
+    if (this.config.permissionPreset !== void 0) {
+      this.ctx.permissionPresets.resolve(this.config.permissionPreset);
+    }
     const headers = await this.ctx.sessionPersistence.list();
     this.persistedIds = new Set(headers.map((header) => String(header.id)));
   }
   /** Process one inbound message after earlier work for the same Weixin user. */
-  process(message, api) {
-    const id = sessionIdFor(this.accountId, message);
+  process(message, api, sendApprovalPrompt) {
+    const baseId = sessionIdFor(this.accountId, message);
+    const rotation = this.rotations.get(baseId) ?? Promise.resolve();
+    return rotation.catch(() => void 0).then(() => {
+      const id = this.activeIdFor(baseId);
+      return this.enqueue(id, () => this.processNow(id, message, api, sendApprovalPrompt));
+    });
+  }
+  /** Execute a registered Harness slash command without sending it to the model. */
+  executeCommand(message, line, api, sendApprovalPrompt) {
+    const baseId = sessionIdFor(this.accountId, message);
+    const rotation = this.rotations.get(baseId) ?? Promise.resolve();
+    return rotation.catch(() => void 0).then(() => {
+      const id = this.activeIdFor(baseId);
+      return this.enqueue(id, () => this.executeCommandNow(id, message, line, api, sendApprovalPrompt));
+    });
+  }
+  /** Rotate one Weixin conversation to a fresh persistent Agent session. */
+  startNewConversation(message) {
+    const baseId = sessionIdFor(this.accountId, message);
+    const previous = this.rotations.get(baseId) ?? Promise.resolve();
+    const current = previous.catch(() => void 0).then(() => this.rotateConversation(baseId));
+    const tracked = current.then(() => void 0, () => void 0).finally(() => {
+      if (this.rotations.get(baseId) === tracked) this.rotations.delete(baseId);
+    });
+    this.rotations.set(baseId, tracked);
+    return current;
+  }
+  enqueue(id, operation) {
     const previous = this.queues.get(id) ?? Promise.resolve();
-    const current = previous.catch(() => void 0).then(() => this.processNow(id, message, api));
-    const tracked = current.finally(() => {
+    const current = previous.catch(() => void 0).then(operation);
+    const tracked = current.then(() => void 0, () => void 0).finally(() => {
       if (this.queues.get(id) === tracked) this.queues.delete(id);
     });
     this.queues.set(id, tracked);
@@ -238,26 +392,159 @@ var ConversationManager = class {
   }
   /** Cancel active work for one Weixin user. */
   cancel(message) {
-    const id = sessionIdFor(this.accountId, message);
-    const agent = this.handles.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
-    if (agent === void 0 || agent.status === "idle") return false;
+    const id = this.activeIdFor(sessionIdFor(this.accountId, message));
+    const approvalCancelled = this.approvals.cancelConversation(id);
+    const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+    if (agent === void 0 || agent.status === "idle") return approvalCancelled;
     agent.cancel({ kind: "user" });
     return true;
   }
+  /** Resolve a pending approval from the same Weixin conversation. */
+  decideApproval(message, command) {
+    return this.approvals.decide(this.activeIdFor(sessionIdFor(this.accountId, message)), command);
+  }
+  /** Close pending approval answerers before the bridge waits for in-flight messages. */
+  cancelPendingApprovals() {
+    this.approvals.cancelAll();
+  }
   /** Dispose every bridge-owned Agent after queued work settles. */
   async dispose() {
+    this.approvals.cancelAll();
+    await Promise.allSettled(this.rotations.values());
     await Promise.allSettled(this.queues.values());
-    await Promise.allSettled([...this.handles.values()].map((handle) => handle.dispose()));
-    this.handles.clear();
+    await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
+    this.bindings.clear();
   }
-  async processNow(id, message, api) {
-    const handle = await this.getOrCreate(id);
-    const agent = handle.agent;
-    const start = agent.session.events.length;
+  async processNow(id, message, api, sendApprovalPrompt) {
+    const binding = await this.getOrCreate(id);
+    const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, api, message, await this.includeImages(agent));
-    agent.followup(createUserMessage({ content, source: { kind: "user" } }));
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
-    return this.collectReply(agent, agent.session.events.slice(start));
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
+    const start = agent.session.events.length;
+    const userMessage = createUserMessage({ content, source: { kind: "user" } });
+    const sendPrompt = sendApprovalPrompt ?? ((text) => {
+      const to = message.from_user_id?.trim();
+      if (!to) return Promise.reject(new Error("Weixin approval has no target user"));
+      return api.sendText(to, text, message.context_token);
+    });
+    const stopApprovalAnswerer = agent.ctx.on(
+      "approval/request",
+      (request) => this.approvals.request(id, request, sendPrompt),
+      { prepend: true }
+    );
+    try {
+      agent.followup(userMessage);
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      } catch (error) {
+        agent.cancel({ kind: "user" });
+        throw error;
+      }
+      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id);
+    } finally {
+      stopApprovalAnswerer();
+    }
+  }
+  async executeCommandNow(id, message, line, api, sendApprovalPrompt) {
+    const binding = await this.getOrCreate(id);
+    const agent = binding.agent;
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command availability");
+    const parsed = parseCommand(line);
+    if (parsed === void 0) {
+      return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
+    }
+    const start = agent.session.events.length;
+    const sendPrompt = sendApprovalPrompt ?? ((text) => {
+      const to = message.from_user_id?.trim();
+      if (!to) return Promise.reject(new Error("Weixin approval has no target user"));
+      return api.sendText(to, text, message.context_token);
+    });
+    const stopApprovalAnswerer = agent.ctx.on(
+      "approval/request",
+      (request) => this.approvals.request(id, request, sendPrompt),
+      { prepend: true }
+    );
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
+    }, this.config.responseTimeoutMs);
+    try {
+      const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+      if (execution === void 0) {
+        return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
+      }
+      clearTimeout(timer);
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
+      } catch (error) {
+        agent.cancel({ kind: "user" });
+        throw error;
+      }
+      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start));
+      const resultText = execution.result.kind === "error" ? `\u547D\u4EE4\u6267\u884C\u5931\u8D25\uFF1A${execution.result.text}` : execution.result.text?.trim() || `\u547D\u4EE4 /${parsed.name} \u5DF2\u6267\u884C\u3002`;
+      return {
+        kind: "handled",
+        reply: generated === void 0 ? { text: resultText, images: [] } : {
+          text: [resultText, generated.text].filter(Boolean).join("\n\n"),
+          images: generated.images
+        }
+      };
+    } finally {
+      clearTimeout(timer);
+      stopApprovalAnswerer();
+    }
+  }
+  async rotateConversation(baseId) {
+    const currentId = this.activeIdFor(baseId);
+    this.approvals.cancelConversation(currentId);
+    const agent = this.bindings.get(currentId)?.agent ?? this.ctx.agents.get(SessionId(currentId));
+    if (agent !== void 0 && agent.status !== "idle") agent.cancel({ kind: "user" });
+    const queued = this.queues.get(currentId);
+    if (queued !== void 0) await queued;
+    if (agent !== void 0) {
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness session reset");
+    }
+    const binding = this.bindings.get(currentId);
+    if (binding !== void 0) {
+      this.bindings.delete(currentId);
+      await binding.release();
+    }
+    const nextId = this.nextSessionId(baseId);
+    this.activeIds.set(baseId, nextId);
+    try {
+      await this.getOrCreate(nextId);
+    } catch (error) {
+      this.activeIds.set(baseId, currentId);
+      throw error;
+    }
+  }
+  activeIdFor(baseId) {
+    const cached = this.activeIds.get(baseId);
+    if (cached !== void 0) return cached;
+    let active = baseId;
+    let generation = 0;
+    for (const id of this.persistedIds) {
+      const candidate = this.sessionGeneration(baseId, id);
+      if (candidate === void 0 || candidate <= generation) continue;
+      generation = candidate;
+      active = id;
+    }
+    this.activeIds.set(baseId, active);
+    return active;
+  }
+  nextSessionId(baseId) {
+    let generation = this.sessionGeneration(baseId, this.activeIdFor(baseId)) ?? 0;
+    for (const id of this.persistedIds) {
+      generation = Math.max(generation, this.sessionGeneration(baseId, id) ?? 0);
+    }
+    return `${baseId}-new-${generation + 1}`;
+  }
+  sessionGeneration(baseId, id) {
+    if (id === baseId) return 0;
+    const prefix = `${baseId}-new-`;
+    if (!id.startsWith(prefix)) return void 0;
+    const generation = Number(id.slice(prefix.length));
+    return Number.isSafeInteger(generation) && generation > 0 ? generation : void 0;
   }
   async includeImages(agent) {
     if (this.config.imageInputMode === "always") return true;
@@ -268,37 +555,98 @@ var ConversationManager = class {
     return info.inputModalities?.includes("image") ?? false;
   }
   async getOrCreate(id) {
-    const existing = this.handles.get(id);
-    if (existing !== void 0) return existing;
+    const sessionId = SessionId(id);
+    const existing = this.bindings.get(id);
+    if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
+    if (existing !== void 0) {
+      this.bindings.delete(id);
+      await existing.release();
+    }
     const pending = this.creations.get(id);
     if (pending !== void 0) return pending;
     const creation = this.createOrResume(id).finally(() => this.creations.delete(id));
     this.creations.set(id, creation);
-    const handle = await creation;
-    this.handles.set(id, handle);
-    return handle;
+    const binding = await creation;
+    this.bindings.set(id, binding);
+    return binding;
   }
   async createOrResume(id) {
     const sessionId = SessionId(id);
+    const live = this.ctx.agents.get(sessionId);
+    if (live !== void 0) return this.borrowAgent(live);
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
-      return this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions });
+      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
+      const agentPreset2 = resolveSessionPreset({
+        header: inspected.meta,
+        events: inspected.events
+      }) ?? this.resolveAgentPreset();
+      try {
+        return this.ownAgent(await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2)
+        }));
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId);
+        if (raced !== void 0) return this.borrowAgent(raced);
+        throw error;
+      }
     }
-    const handle = await this.ctx.agents.create({ sessionId, meta: { cwd: this.config.cwd }, agentOptions });
+    const agentPreset = this.resolveAgentPreset();
+    let handle;
+    try {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: this.config.cwd, agentPreset },
+        agentOptions,
+        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset)
+      });
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId);
+      if (raced !== void 0) return this.borrowAgent(raced);
+      throw error;
+    }
     this.persistedIds.add(id);
     handle.agent.inject(createUserMessage({
       content: [{ type: "text", text: this.config.systemPrompt }],
       source: { kind: "plugin", plugin: "deepseek-harness-weixin", form: "instructions" }
     }));
-    return handle;
+    return this.ownAgent(handle);
   }
-  async collectReply(agent, events) {
+  ownAgent(handle) {
+    return { agent: handle.agent, release: () => handle.dispose() };
+  }
+  borrowAgent(agent) {
+    return { agent, release: () => Promise.resolve() };
+  }
+  resolveAgentPreset() {
+    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
+  }
+  async setupAgent(agentCtx, agentPreset, permissionPreset) {
+    await this.ctx.agentPresets.mount(agentCtx, agentPreset);
+    if (permissionPreset !== void 0) {
+      const agent = agentCtx.agent;
+      if (agent === void 0) throw new Error("weixin-channel: Agent setup context has no Agent");
+      this.ctx.permissionPresets.set(agent.session, permissionPreset);
+    }
+  }
+  async collectReply(agent, events, userMessageId) {
     const texts = [];
     const images = [];
-    for (const event of events) {
-      if (event.type !== "assistant/message") continue;
-      for (const block of event.data.message.content) {
+    const userIndex = events.findIndex((event) => event.type === "user/message" && event.data.id === userMessageId);
+    let turn;
+    for (let index = userIndex; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event?.type !== "turn/start") continue;
+      turn = event.data.turn;
+      break;
+    }
+    const finalTurn = turn === void 0 ? void 0 : [...events].reverse().find((event) => event.type === "turn/end" && event.data.turn === turn);
+    const finalMessage = turn === void 0 ? void 0 : [...events].reverse().find((event) => event.type === "assistant/message" && event.data.turn === turn);
+    if (finalMessage?.type === "assistant/message" && !finalMessage.data.message.content.some((block) => block.type === "tool-call")) {
+      for (const block of finalMessage.data.message.content) {
         if (block.type === "text" && block.text.trim()) texts.push(block.text.trim());
         if (block.type === "image") {
           const stored = await this.ctx.attachments.readImage(block.attachment);
@@ -310,7 +658,6 @@ var ConversationManager = class {
         }
       }
     }
-    const finalTurn = [...events].reverse().find((event) => event.type === "turn/end");
     if (texts.length === 0 && finalTurn?.type === "turn/end" && finalTurn.data.reason.kind === "error") {
       return { text: `\u5904\u7406\u5931\u8D25\uFF08${finalTurn.data.reason.error.code}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002`, images };
     }
@@ -319,6 +666,30 @@ var ConversationManager = class {
     }
     return { text: texts.join("\n\n"), images };
   }
+  async collectLatestReply(agent, events) {
+    const finalTurn = [...events].reverse().find((event) => event.type === "turn/end");
+    if (finalTurn?.type !== "turn/end") return void 0;
+    const finalMessage = [...events].reverse().find((event) => event.type === "assistant/message" && event.data.turn === finalTurn.data.turn);
+    const texts = [];
+    const images = [];
+    if (finalMessage?.type === "assistant/message" && !finalMessage.data.message.content.some((block) => block.type === "tool-call")) {
+      for (const block of finalMessage.data.message.content) {
+        if (block.type === "text" && block.text.trim()) texts.push(block.text.trim());
+        if (block.type === "image") {
+          const stored = await this.ctx.attachments.readImage(block.attachment);
+          images.push({
+            data: stored.data,
+            mediaType: stored.ref.mediaType,
+            ...stored.ref.name === void 0 ? {} : { name: stored.ref.name }
+          });
+        }
+      }
+    }
+    if (texts.length === 0 && images.length === 0 && finalTurn.data.reason.kind === "error") {
+      return { text: `\u5904\u7406\u5931\u8D25\uFF08${finalTurn.data.reason.error.code}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002`, images };
+    }
+    return texts.length === 0 && images.length === 0 ? void 0 : { text: texts.join("\n\n"), images };
+  }
 };
 
 // src/login.ts
@@ -326,8 +697,8 @@ import { createInterface } from "readline/promises";
 
 // src/protocol.ts
 import { createCipheriv, createDecipheriv, createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
-var CHANNEL_VERSION = "0.1.0";
-var BOT_AGENT = "DeepSeek-Harness/0.1.0";
+var CHANNEL_VERSION = "0.2.0";
+var BOT_AGENT = "DeepSeek-Harness/0.2.0";
 var ILINK_APP_ID = "bot";
 var ILINK_APP_CLIENT_VERSION = 2 << 16 | 4 << 8 | 6;
 var DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -713,6 +1084,325 @@ function isAbort2(error) {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
+// src/markdown-filter.ts
+var StreamingMarkdownFilter = class _StreamingMarkdownFilter {
+  buf = "";
+  fence = false;
+  sol = true;
+  inl = null;
+  feed(delta) {
+    this.buf += delta;
+    return this.pump(false);
+  }
+  flush() {
+    return this.pump(true);
+  }
+  pump(eof) {
+    let out = "";
+    while (this.buf) {
+      const sLen = this.buf.length;
+      const sSol = this.sol;
+      const sFence = this.fence;
+      const sInl = this.inl;
+      if (this.fence) out += this.pumpFence(eof);
+      else if (this.inl) out += this.pumpInline(eof);
+      else if (this.sol) out += this.pumpSOL(eof);
+      else out += this.pumpBody(eof);
+      if (this.buf.length === sLen && this.sol === sSol && this.fence === sFence && this.inl === sInl) break;
+    }
+    if (eof && this.inl) {
+      const markers = { image: "![", bold3: "***", italic: "*", ubold3: "___", uitalic: "_" };
+      out += (markers[this.inl.type] ?? "") + this.inl.acc;
+      this.inl = null;
+    }
+    return out;
+  }
+  /** Inside a code fence: pass content and markers through verbatim. */
+  pumpFence(eof) {
+    if (this.sol) {
+      if (this.buf.length < 3 && !eof) return "";
+      if (this.buf.startsWith("```")) {
+        const nl2 = this.buf.indexOf("\n", 3);
+        if (nl2 !== -1) {
+          this.fence = false;
+          const line = this.buf.slice(0, nl2 + 1);
+          this.buf = this.buf.slice(nl2 + 1);
+          this.sol = true;
+          return line;
+        }
+        if (eof) {
+          this.fence = false;
+          const line = this.buf;
+          this.buf = "";
+          return line;
+        }
+        return "";
+      }
+      this.sol = false;
+    }
+    const nl = this.buf.indexOf("\n");
+    if (nl !== -1) {
+      const chunk2 = this.buf.slice(0, nl + 1);
+      this.buf = this.buf.slice(nl + 1);
+      this.sol = true;
+      return chunk2;
+    }
+    const chunk = this.buf;
+    this.buf = "";
+    return chunk;
+  }
+  /** At start of line: detect and consume line-start patterns, then transition to body. */
+  pumpSOL(eof) {
+    const b = this.buf;
+    if (b[0] === "\n") {
+      this.buf = b.slice(1);
+      return "\n";
+    }
+    if (b[0] === "`") {
+      if (b.length < 3 && !eof) return "";
+      if (b.startsWith("```")) {
+        const nl = b.indexOf("\n", 3);
+        if (nl !== -1) {
+          this.fence = true;
+          const line = b.slice(0, nl + 1);
+          this.buf = b.slice(nl + 1);
+          this.sol = true;
+          return line;
+        }
+        if (eof) {
+          this.buf = "";
+          return b;
+        }
+        return "";
+      }
+      this.sol = false;
+      return "";
+    }
+    if (b[0] === ">") {
+      this.sol = false;
+      return "";
+    }
+    if (b[0] === "#") {
+      let n = 0;
+      while (n < b.length && b[n] === "#") n++;
+      if (n === b.length && !eof) return "";
+      if (n >= 5 && n <= 6 && n < b.length && b[n] === " ") {
+        this.buf = b.slice(n + 1);
+        this.sol = false;
+        return "";
+      }
+      this.sol = false;
+      return "";
+    }
+    if (b[0] === " " || b[0] === "	") {
+      if (b.search(/[^ \t]/) === -1 && !eof) return "";
+      this.sol = false;
+      return "";
+    }
+    if (b[0] === "-" || b[0] === "*" || b[0] === "_") {
+      const ch = b[0];
+      let j = 0;
+      while (j < b.length && (b[j] === ch || b[j] === " ")) j++;
+      if (j === b.length && !eof) return "";
+      if (j === b.length || b[j] === "\n") {
+        let count = 0;
+        for (let k = 0; k < j; k++) if (b[k] === ch) count++;
+        if (count >= 3) {
+          if (j < b.length) {
+            this.buf = b.slice(j + 1);
+            this.sol = true;
+            return b.slice(0, j + 1);
+          }
+          this.buf = "";
+          return b;
+        }
+      }
+      this.sol = false;
+      return "";
+    }
+    this.sol = false;
+    return "";
+  }
+  /** Scan line body for inline pattern triggers; output safe chars eagerly. */
+  pumpBody(eof) {
+    let out = "";
+    let i = 0;
+    while (i < this.buf.length) {
+      const c = this.buf[i];
+      if (c === "\n") {
+        out += this.buf.slice(0, i + 1);
+        this.buf = this.buf.slice(i + 1);
+        this.sol = true;
+        return out;
+      }
+      if (c === "!" && i + 1 < this.buf.length && this.buf[i + 1] === "[") {
+        out += this.buf.slice(0, i);
+        this.buf = this.buf.slice(i + 2);
+        this.inl = { type: "image", acc: "" };
+        return out;
+      }
+      if (c === "~") {
+        i++;
+        continue;
+      }
+      if (c === "*") {
+        if (i + 2 < this.buf.length && this.buf[i + 1] === "*" && this.buf[i + 2] === "*") {
+          out += this.buf.slice(0, i);
+          this.buf = this.buf.slice(i + 3);
+          this.inl = { type: "bold3", acc: "" };
+          return out;
+        }
+        if (i + 1 < this.buf.length && this.buf[i + 1] === "*") {
+          i += 2;
+          continue;
+        }
+        if (i + 1 < this.buf.length && this.buf[i + 1] !== " " && this.buf[i + 1] !== "\n") {
+          out += this.buf.slice(0, i);
+          this.buf = this.buf.slice(i + 1);
+          this.inl = { type: "italic", acc: "" };
+          return out;
+        }
+        i++;
+        continue;
+      }
+      if (c === "_") {
+        if (i + 2 < this.buf.length && this.buf[i + 1] === "_" && this.buf[i + 2] === "_") {
+          out += this.buf.slice(0, i);
+          this.buf = this.buf.slice(i + 3);
+          this.inl = { type: "ubold3", acc: "" };
+          return out;
+        }
+        if (i + 1 < this.buf.length && this.buf[i + 1] === "_") {
+          i += 2;
+          continue;
+        }
+        if (i + 1 < this.buf.length && this.buf[i + 1] !== " " && this.buf[i + 1] !== "\n") {
+          out += this.buf.slice(0, i);
+          this.buf = this.buf.slice(i + 1);
+          this.inl = { type: "uitalic", acc: "" };
+          return out;
+        }
+        i++;
+        continue;
+      }
+      i++;
+    }
+    let hold = 0;
+    if (!eof) {
+      if (this.buf.endsWith("**")) hold = 2;
+      else if (this.buf.endsWith("__")) hold = 2;
+      else if (this.buf.endsWith("*")) hold = 1;
+      else if (this.buf.endsWith("_")) hold = 1;
+      else if (this.buf.endsWith("!")) hold = 1;
+    }
+    out += this.buf.slice(0, this.buf.length - hold);
+    this.buf = hold > 0 ? this.buf.slice(-hold) : "";
+    return out;
+  }
+  /** Accumulate inline content until closing marker is found. */
+  pumpInline(_eof) {
+    if (!this.inl) return "";
+    this.inl.acc += this.buf;
+    this.buf = "";
+    switch (this.inl.type) {
+      case "bold3": {
+        const idx = this.inl.acc.indexOf("***");
+        if (idx !== -1) {
+          const content = this.inl.acc.slice(0, idx);
+          this.buf = this.inl.acc.slice(idx + 3);
+          this.inl = null;
+          if (_StreamingMarkdownFilter.containsCJK(content)) return content;
+          return `***${content}***`;
+        }
+        return "";
+      }
+      case "ubold3": {
+        const idx = this.inl.acc.indexOf("___");
+        if (idx !== -1) {
+          const content = this.inl.acc.slice(0, idx);
+          this.buf = this.inl.acc.slice(idx + 3);
+          this.inl = null;
+          if (_StreamingMarkdownFilter.containsCJK(content)) return content;
+          return `___${content}___`;
+        }
+        return "";
+      }
+      case "italic": {
+        for (let j = 0; j < this.inl.acc.length; j++) {
+          if (this.inl.acc[j] === "\n") {
+            const r = "*" + this.inl.acc.slice(0, j + 1);
+            this.buf = this.inl.acc.slice(j + 1);
+            this.inl = null;
+            this.sol = true;
+            return r;
+          }
+          if (this.inl.acc[j] === "*") {
+            if (j + 1 < this.inl.acc.length && this.inl.acc[j + 1] === "*") {
+              j++;
+              continue;
+            }
+            const content = this.inl.acc.slice(0, j);
+            this.buf = this.inl.acc.slice(j + 1);
+            this.inl = null;
+            if (_StreamingMarkdownFilter.containsCJK(content)) return content;
+            return `*${content}*`;
+          }
+        }
+        return "";
+      }
+      case "uitalic": {
+        for (let j = 0; j < this.inl.acc.length; j++) {
+          if (this.inl.acc[j] === "\n") {
+            const r = "_" + this.inl.acc.slice(0, j + 1);
+            this.buf = this.inl.acc.slice(j + 1);
+            this.inl = null;
+            this.sol = true;
+            return r;
+          }
+          if (this.inl.acc[j] === "_") {
+            if (j + 1 < this.inl.acc.length && this.inl.acc[j + 1] === "_") {
+              j++;
+              continue;
+            }
+            const content = this.inl.acc.slice(0, j);
+            this.buf = this.inl.acc.slice(j + 1);
+            this.inl = null;
+            if (_StreamingMarkdownFilter.containsCJK(content)) return content;
+            return `_${content}_`;
+          }
+        }
+        return "";
+      }
+      case "image": {
+        const cb = this.inl.acc.indexOf("]");
+        if (cb === -1) return "";
+        if (cb + 1 >= this.inl.acc.length) return "";
+        if (this.inl.acc[cb + 1] !== "(") {
+          const r = "![" + this.inl.acc.slice(0, cb + 1);
+          this.buf = this.inl.acc.slice(cb + 1);
+          this.inl = null;
+          return r;
+        }
+        const cp = this.inl.acc.indexOf(")", cb + 2);
+        if (cp !== -1) {
+          this.buf = this.inl.acc.slice(cp + 1);
+          this.inl = null;
+          return "";
+        }
+        return "";
+      }
+    }
+    return "";
+  }
+  static containsCJK(text) {
+    return /[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]/.test(text);
+  }
+};
+function filterMarkdownForWeixin(text) {
+  const filter = new StreamingMarkdownFilter();
+  return filter.feed(text) + filter.flush();
+}
+
 // src/state.ts
 import { chmod, mkdir, open, readFile, rename, unlink } from "fs/promises";
 import { dirname } from "path";
@@ -772,6 +1462,9 @@ var WeixinHarnessBridge = class {
     if (config.statePath && !isAbsolute(config.statePath)) {
       throw new Error(`weixin-channel: statePath must be absolute, got ${JSON.stringify(config.statePath)}`);
     }
+    if (config.approvalTimeoutMs >= config.responseTimeoutMs) {
+      throw new Error("weixin-channel: approvalTimeoutMs must be less than responseTimeoutMs");
+    }
     this.log = ctx.logger("deepseek-harness-weixin");
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
   }
@@ -808,6 +1501,7 @@ var WeixinHarnessBridge = class {
     if (this.stopping) return;
     this.stopping = true;
     this.abortController.abort();
+    this.conversations?.cancelPendingApprovals();
     if (this.monitorTask !== void 0) await this.monitorTask;
     await Promise.allSettled(this.inFlight);
     if (this.conversations !== void 0) await this.conversations.dispose();
@@ -893,9 +1587,12 @@ var WeixinHarnessBridge = class {
   }
   async dispatch(message, api) {
     if (message.message_type !== void 0 && message.message_type !== MessageType.USER) return;
-    if (!message.from_user_id?.trim() || !this.allowed(message.from_user_id)) return;
+    const sender = message.from_user_id?.trim();
+    if (!sender || !this.allowed(sender)) return;
     if (this.seen.hasOrAdd(messageKey(message))) return;
-    while (this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
+    const command = commandText(message);
+    const bypassCapacity = command === "/bot-cancel" || command === "/new" || command === "/reset" || parseApprovalCommand(command) !== void 0;
+    while (!bypassCapacity && this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
       await Promise.race(this.inFlight);
     }
     if (this.stopping) return;
@@ -911,6 +1608,33 @@ var WeixinHarnessBridge = class {
   }
   async handleMessage(message, api) {
     const command = commandText(message);
+    const approvalCommand = parseApprovalCommand(command);
+    if (approvalCommand === "invalid") {
+      await this.sendReply(message, api, {
+        text: "\u5BA1\u6279\u547D\u4EE4\u683C\u5F0F\u4E0D\u6B63\u786E\u3002\u8BF7\u56DE\u590D /approve 123456 \u6216 /reject 123456\u3002",
+        images: []
+      });
+      return;
+    }
+    if (approvalCommand !== void 0) {
+      const resolved = this.requireConversations().decideApproval(message, approvalCommand);
+      const text = resolved === void 0 ? `\u6CA1\u6709\u627E\u5230\u5F85\u5904\u7406\u7684\u5BA1\u6279 ${approvalCommand.code}\uFF1B\u5B83\u53EF\u80FD\u5DF2\u5B8C\u6210\u3001\u53D6\u6D88\u6216\u8D85\u65F6\u3002` : resolved.outcome === "allowed-once" ? `\u5DF2\u6279\u51C6 ${resolved.toolName}\uFF08${resolved.code}\uFF09\uFF0C\u6B63\u5728\u7EE7\u7EED\u6267\u884C\u3002` : `\u5DF2\u62D2\u7EDD ${resolved.toolName}\uFF08${resolved.code}\uFF09\u3002`;
+      await this.sendReply(message, api, { text, images: [] });
+      return;
+    }
+    if (command === "/new" || command === "/reset") {
+      try {
+        await this.requireConversations().startNewConversation(message);
+        await this.sendReply(message, api, {
+          text: "\u5DF2\u5F00\u59CB\u65B0\u7684 Harness \u4F1A\u8BDD\uFF1B\u65E7 session \u5DF2\u4FDD\u7559\uFF0C\u53EF\u7EE7\u7EED\u5728 Web \u4E2D\u67E5\u770B\u3002",
+          images: []
+        });
+      } catch (error) {
+        this.log.error("Weixin new-session command failed: %s", String(error));
+        await this.sendReply(message, api, { text: "\u521B\u5EFA\u65B0\u7684 Harness \u4F1A\u8BDD\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [] });
+      }
+      return;
+    }
     if (command === "/bot-ping") {
       await this.sendReply(message, api, { text: "pong \u2014 DeepSeek Harness \u5FAE\u4FE1\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [] });
       return;
@@ -923,6 +1647,10 @@ var WeixinHarnessBridge = class {
           "/bot-image-test \u2014 \u53D1\u9001\u84DD\u8272\u56FE\u7247\uFF0C\u68C0\u67E5\u56FE\u7247\u94FE\u8DEF",
           "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u8FDE\u63A5\u72B6\u6001",
           "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
+          "/new \u6216 /reset \u2014 \u4FDD\u7559\u65E7 session \u5E76\u5F00\u59CB\u65B0\u4F1A\u8BDD",
+          "/approve 123456 \u2014 \u6279\u51C6\u4E00\u6B21\u5F85\u5904\u7406\u5DE5\u5177\u8C03\u7528",
+          "/reject 123456 \u2014 \u62D2\u7EDD\u4E00\u6B21\u5F85\u5904\u7406\u5DE5\u5177\u8C03\u7528",
+          "Harness \u6CE8\u518C\u7684\u659C\u6760\u547D\u4EE4\u4F1A\u76F4\u63A5\u4EA4\u7ED9\u547D\u4EE4\u8FD0\u884C\u65F6\uFF0C\u4E0D\u4F1A\u53D1\u9001\u7ED9\u6A21\u578B\u3002",
           "\u5176\u4ED6\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
         ].join("\n"),
         images: []
@@ -951,8 +1679,43 @@ var WeixinHarnessBridge = class {
       });
       return;
     }
+    const slashLine = messageText(message);
+    if (parseCommand2(slashLine) !== void 0) {
+      try {
+        const outcome = await this.requireConversations().executeCommand(
+          message,
+          slashLine,
+          api,
+          (text) => this.sendTextReply(message, api, text)
+        );
+        if (outcome.kind === "handled") {
+          await this.sendReply(message, api, outcome.reply);
+        } else {
+          const available = ["/new", "/reset", ...outcome.available];
+          await this.sendReply(message, api, {
+            text: `\u672A\u77E5\u547D\u4EE4 ${JSON.stringify(slashLine.split(/\s/u, 1)[0])}\u3002\u53EF\u7528\u547D\u4EE4\uFF1A${available.join("\u3001") || "\u65E0"}\u3002`,
+            images: []
+          });
+        }
+      } catch (error) {
+        this.log.error("Weixin Harness command failed: %s", String(error));
+        await this.sendReply(message, api, { text: "\u6267\u884C Harness \u547D\u4EE4\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [] });
+      }
+      return;
+    }
+    if (slashLine.startsWith("/")) {
+      await this.sendReply(message, api, {
+        text: "\u659C\u6760\u547D\u4EE4\u683C\u5F0F\u4E0D\u6B63\u786E\uFF1B\u547D\u4EE4\u540D\u53EA\u80FD\u4F7F\u7528\u5C0F\u5199\u5B57\u6BCD\u3001\u6570\u5B57\u3001\u4E0B\u5212\u7EBF\u6216\u8FDE\u5B57\u7B26\u3002",
+        images: []
+      });
+      return;
+    }
     try {
-      const reply = await this.requireConversations().process(message, api);
+      const reply = await this.requireConversations().process(
+        message,
+        api,
+        (text) => this.sendTextReply(message, api, text)
+      );
       await this.sendReply(message, api, reply);
     } catch (error) {
       this.log.error("Weixin message processing failed: %s", String(error));
@@ -967,13 +1730,23 @@ var WeixinHarnessBridge = class {
     const to = message.from_user_id?.trim();
     if (!to) throw new Error("Weixin reply has no target user");
     const images = reply.images.slice(0, this.config.maxReplyImages);
-    const text = truncateUtf8(reply.text || (images.length === 0 ? "\u5904\u7406\u5B8C\u6210\u3002" : ""), this.config.maxReplyBytes);
+    const filteredText = filterMarkdownForWeixin(reply.text);
+    const text = truncateUtf8(
+      filteredText.trim() ? filteredText : images.length === 0 ? "\u5904\u7406\u5B8C\u6210\u3002" : "",
+      this.config.maxReplyBytes
+    );
     if (text) {
-      await this.retry(() => api.sendText(to, text, message.context_token));
+      await this.sendTextReply(message, api, text);
     }
     for (const image of images) {
       await this.retry(() => api.sendImage(to, image.data, message.context_token));
     }
+  }
+  async sendTextReply(message, api, text) {
+    const to = message.from_user_id?.trim();
+    if (!to) throw new Error("Weixin reply has no target user");
+    const bounded = truncateUtf8(text, this.config.maxReplyBytes);
+    if (bounded) await this.retry(() => api.sendText(to, bounded, message.context_token));
   }
   async retry(operation) {
     let lastError;
@@ -993,7 +1766,10 @@ var WeixinHarnessBridge = class {
   }
 };
 function commandText(message) {
-  return (message.item_list ?? []).filter((item) => item.type === MessageItemType.TEXT).map((item) => item.text_item?.text ?? "").join("\n").trim().toLowerCase();
+  return messageText(message).toLowerCase();
+}
+function messageText(message) {
+  return (message.item_list ?? []).filter((item) => item.type === MessageItemType.TEXT).map((item) => item.text_item?.text ?? "").join("\n").trim();
 }
 function resolveStatePath(configured, accountId) {
   if (configured) return configured;
@@ -1009,12 +1785,15 @@ import z from "@deepseek-ai/schemastery";
 var Config = z.object({
   credentialRef: z.string().default("WEIXIN_ILINK_CREDENTIAL"),
   cwd: z.string().required(),
+  agentPreset: z.string(),
+  permissionPreset: z.string(),
   statePath: z.string().default(""),
   autoLogin: z.boolean().default(true),
   accessPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
   allowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
   responseTimeoutMs: z.number().step(1).min(1).default(3e5),
+  approvalTimeoutMs: z.number().step(1).min(1e3).default(24e4),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(3e4),
   apiTimeoutMs: z.number().step(1).min(1).default(15e3),
   longPollTimeoutMs: z.number().step(1).min(1e3).default(35e3),
@@ -1030,13 +1809,24 @@ var Config = z.object({
   maxOutboundImageBytes: z.number().step(1).min(1024).max(100 * 1024 * 1024).default(10 * 1024 * 1024),
   maxSeenMessageIds: z.number().step(1).min(100).max(1e5).default(5e3),
   systemPrompt: z.string().default(
-    "You are replying through Weixin. Keep replies clear and suitable for private chat. Do not reveal credentials, context tokens, or internal system data. When a request needs an interactive approval that Weixin cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through Weixin. Keep replies clear and suitable for private chat. Do not reveal credentials, context tokens, or internal system data. Interactive tool approvals are routed to the same Weixin user through /approve and /reject commands; wait for the recorded decision and never fabricate one."
   )
 });
 
 // src/index.ts
 var name = "deepseek-harness-weixin";
-var inject = ["agentDefaultModel", "agents", "attachments", "credentials", "llm", "sessionPersistence"];
+var inject = [
+  "agentDefaultModel",
+  "agentPresets",
+  "agents",
+  "approval",
+  "attachments",
+  "commands",
+  "credentials",
+  "llm",
+  "permissionPresets",
+  "sessionPersistence"
+];
 async function apply(ctx, config) {
   const bridge = new WeixinHarnessBridge(ctx, config);
   await ctx.effect(async function* () {
@@ -1048,15 +1838,20 @@ var index_default = { name, inject, Config, apply };
 export {
   Config,
   SeenMessageIds,
+  StreamingMarkdownFilter,
   WeixinApiClient,
+  WeixinApprovalRegistry,
   WeixinHarnessBridge,
   apply,
   index_default as default,
   detectImageMediaType,
+  filterMarkdownForWeixin,
+  formatApprovalPrompt,
   inboundContent,
   inject,
   loginWithQr,
   name,
+  parseApprovalCommand,
   parseCredential,
   sessionIdFor,
   truncateUtf8

@@ -62,26 +62,59 @@ function commandContext(value: string | undefined): never {
       set: vi.fn(async () => undefined),
     },
     sessionPersistence: { list: vi.fn(async () => []) },
+    commands: {
+      execute: vi.fn(async () => undefined),
+      list: vi.fn(() => []),
+    },
   } as never
 }
 
-function agentContext(): never {
+function agentContext(replyText = 'model reply', includeToolStep = false, stallResponse = false): never {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
   const events: unknown[] = []
   const ref = { attachmentId: 'sha256:reply', mediaType: 'image/png', bytes: 3, width: 1, height: 1 }
+  let idleCalls = 0
+  let registeredId: string | undefined
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
     session: { events },
+    ctx: { on: vi.fn(() => vi.fn()) },
     inject: vi.fn(),
-    followup: vi.fn(() => {
-      events.push({ type: 'assistant/message', data: { message: { content: [
-        { type: 'text', text: 'model reply' },
+    followup: vi.fn((userMessage: { id: string }) => {
+      events.push(
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: userMessage },
+        { type: 'step/start', data: { turn: 1, step: 1 } },
+      )
+      if (includeToolStep) {
+        events.push(
+          { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [
+            { type: 'text', text: '正在查看目录。' },
+            { type: 'tool-call', id: 'call-1', name: 'Bash', arguments: '{"command":"ls"}' },
+          ] } } },
+          { type: 'tool/call', data: { turn: 1, step: 1, callId: 'call-1', name: 'Bash', arguments: '{"command":"ls"}' } },
+          { type: 'tool/result', data: { turn: 1, step: 1, message: { source: { callId: 'call-1' } } } },
+          { type: 'step/end', data: { turn: 1, step: 1 } },
+          { type: 'step/start', data: { turn: 1, step: 2 } },
+        )
+      }
+      const step = includeToolStep ? 2 : 1
+      events.push({ type: 'assistant/message', data: { turn: 1, step, message: { content: [
+        { type: 'text', text: replyText },
         { type: 'image', attachment: ref },
       ] } } })
-      events.push({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
+      events.push(
+        { type: 'step/end', data: { turn: 1, step } },
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      )
     }),
-    whenIdle: vi.fn(async () => undefined),
+    whenIdle: vi.fn(() => {
+      idleCalls += 1
+      if (stallResponse && idleCalls > 1) return new Promise<void>(() => undefined)
+      return Promise.resolve()
+    }),
+    cancel: vi.fn(),
   }
   return {
     logger: vi.fn(() => logger),
@@ -90,9 +123,26 @@ function agentContext(): never {
       set: vi.fn(async () => undefined),
     },
     sessionPersistence: { list: vi.fn(async () => []) },
+    commands: {
+      execute: vi.fn(async () => undefined),
+      list: vi.fn(() => []),
+    },
     agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+    agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
-    agents: { create: vi.fn(async () => ({ agent, dispose: vi.fn(async () => undefined) })), get: vi.fn() },
+    agents: {
+      create: vi.fn(async (options: { sessionId?: string; setup?: (ctx: never) => Promise<void> }) => {
+        await options.setup?.({} as never)
+        registeredId = options.sessionId
+        return {
+          agent,
+          dispose: vi.fn(async () => {
+            if (registeredId === options.sessionId) registeredId = undefined
+          }),
+        }
+      }),
+      get: vi.fn((id: string) => String(id) === registeredId ? agent : undefined),
+    },
     attachments: {
       imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       readImage: vi.fn(async () => ({ ref, data: new Uint8Array([1, 2, 3]) })),
@@ -138,6 +188,107 @@ describe('WeixinHarnessBridge', () => {
     expect(factory).not.toHaveBeenCalled()
   })
 
+  it('requires the approval deadline to leave time for the Agent Loop to finish', () => {
+    expect(() => new WeixinHarnessBridge(
+      commandContext(JSON.stringify(CREDENTIAL)),
+      testConfig({ responseTimeoutMs: 1_000, approvalTimeoutMs: 1_000 }),
+    )).toThrow('approvalTimeoutMs must be less than responseTimeoutMs')
+  })
+
+  it('intercepts malformed and expired approval commands instead of sending them to the model', async () => {
+    const api = new FakeApi({
+      ret: 0,
+      msgs: [
+        message('/approve nope', 20),
+        message('/approve 123456', 21),
+        message('/reject 654321', 22),
+      ],
+    })
+    const bridge = new WeixinHarnessBridge(
+      commandContext(JSON.stringify(CREDENTIAL)),
+      testConfig(),
+      () => api,
+    )
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts).toHaveLength(3))
+    expect(api.sentTexts.map(sent => sent.text)).toEqual(expect.arrayContaining([
+      expect.stringContaining('审批命令格式不正确'),
+      expect.stringContaining('没有找到待处理的审批 123456'),
+      expect.stringContaining('没有找到待处理的审批 654321'),
+    ]))
+    await bridge.stop()
+  })
+
+  it('starts a fresh persistent session for /new without sending the command to the model', async () => {
+    const api = new FakeApi({ ret: 0, msgs: [message('/new', 23)] })
+    const ctx = agentContext()
+    const bridge = new WeixinHarnessBridge(ctx, testConfig(), () => api)
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts).toHaveLength(1))
+    expect(api.sentTexts[0]?.text).toContain('已开始新的 Harness 会话')
+
+    const create = (ctx as { agents: { create: ReturnType<typeof vi.fn> } }).agents.create
+    expect(create).toHaveBeenCalledOnce()
+    expect(create.mock.calls[0]?.[0]).toMatchObject({
+      sessionId: expect.stringMatching(/-new-1$/),
+    })
+    const handle = await create.mock.results[0]?.value
+    expect(handle.agent.followup).not.toHaveBeenCalled()
+    await bridge.stop()
+  })
+
+  it('routes registered Harness slash commands directly and keeps unknown commands out of the model', async () => {
+    const api = new FakeApi({
+      ret: 0,
+      msgs: [message('/plan off', 24), message('/missing', 25)],
+    })
+    const ctx = agentContext()
+    const commands = (ctx as {
+      commands: {
+        execute: ReturnType<typeof vi.fn>
+        list: ReturnType<typeof vi.fn>
+      }
+    }).commands
+    commands.execute
+      .mockResolvedValueOnce({ commandId: 'cmd-plan', result: { kind: 'success', text: 'Plan mode off.' } })
+      .mockResolvedValueOnce(undefined)
+    commands.list.mockReturnValue([{ name: 'plan', description: 'Enter or leave plan mode' }])
+
+    const bridge = new WeixinHarnessBridge(ctx, testConfig(), () => api)
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts).toHaveLength(2))
+    expect(api.sentTexts.map(sent => sent.text)).toEqual(expect.arrayContaining([
+      'Plan mode off.',
+      expect.stringContaining('未知命令 "/missing"'),
+    ]))
+    expect(commands.execute).toHaveBeenCalledTimes(2)
+
+    const create = (ctx as { agents: { create: ReturnType<typeof vi.fn> } }).agents.create
+    const handle = await create.mock.results[0]?.value
+    expect(handle.agent.followup).not.toHaveBeenCalled()
+    await bridge.stop()
+  })
+
+  it('lets an approval command bypass a generation occupying the in-flight limit', async () => {
+    const api = new FakeApi({
+      ret: 0,
+      msgs: [message('keep working', 30), message('/approve 123456', 31)],
+    })
+    const bridge = new WeixinHarnessBridge(
+      agentContext('late reply', false, true),
+      testConfig({
+        maxInFlightMessages: 1,
+        responseTimeoutMs: 100,
+        approvalTimeoutMs: 50,
+      }),
+      () => api,
+    )
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts.some(sent =>
+      sent.text.includes('没有找到待处理的审批 123456'))).toBe(true))
+    await bridge.stop()
+  })
+
   it('sends the built-in image diagnostic through the image API', async () => {
     const api = new FakeApi({ ret: 0, msgs: [message('/bot-image-test', 2)] })
     const bridge = new WeixinHarnessBridge(commandContext(JSON.stringify(CREDENTIAL)), testConfig(), () => api)
@@ -154,6 +305,34 @@ describe('WeixinHarnessBridge', () => {
     await bridge.start()
     await vi.waitFor(() => expect(api.sentImages).toHaveLength(1))
     expect(api.sentTexts[0]?.text).toBe('model reply')
+    await bridge.stop()
+  })
+
+  it('filters model output to the Tencent-compatible Markdown subset before sending', async () => {
+    const api = new FakeApi({ ret: 0, msgs: [message('markdown please', 5)] })
+    const reply = [
+      '## 标题',
+      '**重点**和*中文斜体*![模型图片](https://example.com/image.png)',
+    ].join('\n')
+    const bridge = new WeixinHarnessBridge(agentContext(reply), testConfig(), () => api)
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts).toHaveLength(1))
+    expect(api.sentTexts[0]?.text).toBe('## 标题\n**重点**和中文斜体')
+    await bridge.stop()
+  })
+
+  it('sends only the final visible response after a structured tool step', async () => {
+    const api = new FakeApi({ ret: 0, msgs: [message('我当前有啥文件？', 6)] })
+    const bridge = new WeixinHarnessBridge(agentContext('当前文件：README.md', true), testConfig(), () => api)
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentTexts).toHaveLength(1))
+
+    expect(api.sentTexts[0]?.text).toBe('当前文件：README.md')
+    expect(api.sentTexts[0]?.text).not.toContain('正在查看目录。')
+    for (const sent of api.sentTexts) {
+      expect(sent.text).not.toContain('<｜｜DSML｜｜tool_calls>')
+      expect(sent.text).not.toContain('<｜｜DSML｜｜invoke')
+    }
     await bridge.stop()
   })
 
