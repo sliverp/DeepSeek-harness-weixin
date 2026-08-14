@@ -8,9 +8,13 @@ const MAX_CONTROL_MESSAGE_BYTES = 4_096
 const DEFAULT_CLIENT_TIMEOUT_MS = 30_000
 
 export type WeixinControlResponse =
-  | { ok: true; kind: 'connected' }
   | { ok: true; kind: 'qr'; reused: boolean; url: string }
   | { ok: false; error: string }
+
+export interface WeixinControlRequestOptions {
+  timeoutMs?: number
+  urlOnly?: boolean
+}
 
 export interface WeixinControlLogger {
   info(message: string, ...args: unknown[]): void
@@ -39,7 +43,7 @@ export class WeixinControlServer {
 
   constructor(
     readonly socketPath: string,
-    private readonly requestLogin: (signal?: AbortSignal) => Promise<WeixinLoginRequest>,
+    private readonly requestLogin: (signal?: AbortSignal, displayQr?: boolean) => Promise<WeixinLoginRequest>,
     private readonly log: WeixinControlLogger,
   ) {
     if (!isAbsolute(socketPath)) throw new Error(`weixin control socket path must be absolute, got ${JSON.stringify(socketPath)}`)
@@ -138,10 +142,10 @@ export class WeixinControlServer {
       return { ok: false, error: 'invalid control request' }
     }
     if (!isLoginRequest(request)) return { ok: false, error: 'unknown control command' }
-    const result = await this.requestLogin(signal)
-    return result.kind === 'connected'
-      ? { ok: true, kind: 'connected' }
-      : { ok: true, kind: 'qr', reused: result.reused, url: result.url }
+    // The control client owns presentation: the ordinary CLI renders the QR in
+    // its terminal, while --url prints only the returned URL.
+    const result = await this.requestLogin(signal, false)
+    return { ok: true, kind: 'qr', reused: result.reused, url: result.url }
   }
 
   private respond(socket: Socket, response: WeixinControlResponse): void {
@@ -153,13 +157,15 @@ export class WeixinControlServer {
 /** Ask the live plugin for a QR from a one-shot Linux CLI process. */
 export function requestLoginFromControlSocket(
   socketPath: string,
-  timeoutMs = DEFAULT_CLIENT_TIMEOUT_MS,
+  options: WeixinControlRequestOptions | number = {},
 ): Promise<WeixinControlResponse> {
   if (!isAbsolute(socketPath)) return Promise.reject(new Error('control socket path must be absolute'))
+  const resolvedOptions = typeof options === 'number' ? { timeoutMs: options } : options
   return new Promise<WeixinControlResponse>((resolveResponse, rejectResponse) => {
     const socket = createConnection(socketPath)
     let input = ''
     let settled = false
+    const timeoutMs = resolvedOptions.timeoutMs ?? DEFAULT_CLIENT_TIMEOUT_MS
     const timer = setTimeout(() => settleError(new Error(`control request timed out after ${timeoutMs}ms`)), timeoutMs)
 
     const cleanup = (): void => {
@@ -181,7 +187,10 @@ export function requestLoginFromControlSocket(
     }
 
     socket.setEncoding('utf8')
-    socket.once('connect', () => socket.write('{"command":"login"}\n'))
+    socket.once('connect', () => socket.write(`${JSON.stringify({
+      command: 'login',
+      ...(resolvedOptions.urlOnly === true ? { urlOnly: true } : {}),
+    })}\n`))
     socket.once('error', settleError)
     socket.on('data', chunk => {
       input += chunk
@@ -203,9 +212,11 @@ export function requestLoginFromControlSocket(
   })
 }
 
-function isLoginRequest(value: unknown): value is { command: 'login' } {
+function isLoginRequest(value: unknown): value is { command: 'login'; urlOnly?: boolean } {
   return typeof value === 'object' && value !== null
     && (value as { command?: unknown }).command === 'login'
+    && ((value as { urlOnly?: unknown }).urlOnly === undefined
+      || typeof (value as { urlOnly?: unknown }).urlOnly === 'boolean')
 }
 
 function parseControlResponse(value: unknown): WeixinControlResponse {
@@ -214,7 +225,6 @@ function parseControlResponse(value: unknown): WeixinControlResponse {
   if (response.ok === false && typeof response.error === 'string') {
     return { ok: false, error: response.error }
   }
-  if (response.ok === true && response.kind === 'connected') return { ok: true, kind: 'connected' }
   if (response.ok === true && response.kind === 'qr' && typeof response.url === 'string'
     && typeof response.reused === 'boolean') {
     return { ok: true, kind: 'qr', reused: response.reused, url: response.url }

@@ -11,6 +11,13 @@ const CREDENTIAL: WeixinCredential = {
   userId: 'user-1',
 }
 
+const REPLACEMENT_CREDENTIAL: WeixinCredential = {
+  token: 'replacement-token',
+  accountId: 'replacement@im.bot',
+  baseUrl: 'https://replacement.ilink.example',
+  userId: 'user-2',
+}
+
 class FakeApi implements WeixinApiPort {
   readonly sentTexts: Array<{ to: string; text: string; context?: string }> = []
   readonly sentImages: Array<{ to: string; data: Uint8Array; context?: string }> = []
@@ -230,6 +237,52 @@ describe('WeixinHarnessBridge', () => {
     expect((ctx as { credentials: { set: ReturnType<typeof vi.fn> } }).credentials.set)
       .toHaveBeenCalledWith('WEIXIN_ILINK_CREDENTIAL', JSON.stringify(CREDENTIAL))
     await bridge.stop()
+  })
+
+  it('forces QR login while connected and hot-switches to the replacement credential', async () => {
+    const oldApi = new FakeApi()
+    const replacementApi = new FakeApi()
+    const factory = vi.fn()
+      .mockReturnValueOnce(oldApi)
+      .mockReturnValueOnce(replacementApi)
+    const ctx = commandContext(JSON.stringify(CREDENTIAL))
+    const showQr = vi.fn(async () => undefined)
+    let finishLogin!: (credential: WeixinCredential) => void
+    const login = vi.fn(async (options: {
+      callbacks?: { showQr?: (url: string) => Promise<void> }
+    }) => {
+      const completed = new Promise<WeixinCredential>(resolve => { finishLogin = resolve })
+      await options.callbacks?.showQr?.('https://qr.example/replacement')
+      return completed
+    })
+    const bridge = new WeixinHarnessBridge(
+      ctx,
+      testConfig(),
+      factory as never,
+      login as never,
+      showQr,
+    )
+    await bridge.start()
+
+    await expect(bridge.requestLogin(undefined, false)).resolves.toEqual({
+      kind: 'qr-shown',
+      reused: false,
+      url: 'https://qr.example/replacement',
+    })
+    expect(login).toHaveBeenCalledWith(expect.objectContaining({
+      existingTokens: [CREDENTIAL.token],
+    }))
+    expect(showQr).not.toHaveBeenCalled()
+    expect(oldApi.notifyStop).not.toHaveBeenCalled()
+
+    finishLogin(REPLACEMENT_CREDENTIAL)
+    await vi.waitFor(() => expect(replacementApi.notifyStart).toHaveBeenCalledOnce())
+    expect(oldApi.notifyStop).toHaveBeenCalledOnce()
+    expect((ctx as { credentials: { set: ReturnType<typeof vi.fn> } }).credentials.set)
+      .toHaveBeenCalledWith('WEIXIN_ILINK_CREDENTIAL', JSON.stringify(REPLACEMENT_CREDENTIAL))
+
+    await bridge.stop()
+    expect(replacementApi.notifyStop).toHaveBeenCalledOnce()
   })
 
   it('starts a new QR flow after an earlier background scan attempt expires', async () => {

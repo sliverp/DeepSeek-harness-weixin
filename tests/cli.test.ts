@@ -41,4 +41,30 @@ describe('dsh-weixin CLI', () => {
 
     await server.stop()
   })
+
+  it('prints exactly the URL and does not render a QR with --url', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-weixin-cli-url-'))
+    temporaryDirectories.push(directory)
+    const socketPath = join(directory, 'control.sock')
+    const requestLogin = vi.fn(async (_signal?: AbortSignal, _displayQr?: boolean) => ({
+      kind: 'qr-shown' as const,
+      reused: false,
+      url: 'https://qr.example/url-only',
+    }))
+    const server = new WeixinControlServer(
+      socketPath,
+      requestLogin,
+      { info: vi.fn(), warn: vi.fn() },
+    )
+    server.startInBackground()
+    await vi.waitFor(async () => expect((await lstat(socketPath)).isSocket()).toBe(true))
+    const output = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+
+    await expect(run(['login', '--url', '--socket', socketPath])).resolves.toBe(0)
+    expect(output.mock.calls.flat().join('')).toBe('https://qr.example/url-only')
+    expect(generateQr).not.toHaveBeenCalled()
+    expect(requestLogin.mock.calls[0]?.[1]).toBe(false)
+
+    await server.stop()
+  })
 })

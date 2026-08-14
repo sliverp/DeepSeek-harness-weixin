@@ -2,7 +2,7 @@
 import {
   requestLoginFromControlSocket,
   resolveControlSocketPath
-} from "./chunk-2OXSSMUP.js";
+} from "./chunk-LVGDSBED.js";
 
 // src/cli.ts
 import { realpathSync } from "fs";
@@ -24,7 +24,7 @@ ${usage()}`);
   }
   let response;
   try {
-    response = await requestLoginFromControlSocket(options.socketPath);
+    response = await requestLoginFromControlSocket(options.socketPath, { urlOnly: options.urlOnly });
   } catch (error) {
     const code = error.code;
     const detail = code === "ENOENT" || code === "ECONNREFUSED" ? "\u5FAE\u4FE1\u63D2\u4EF6\u63A7\u5236\u901A\u9053\u5C1A\u672A\u8FD0\u884C\uFF0C\u8BF7\u5148\u542F\u52A8 pnpm dsh web\u3002" : `\u65E0\u6CD5\u8FDE\u63A5\u5FAE\u4FE1\u63D2\u4EF6\u63A7\u5236\u901A\u9053\uFF1A${renderError(error)}`;
@@ -38,8 +38,8 @@ Socket: ${options.socketPath}
 `);
     return 1;
   }
-  if (response.kind === "connected") {
-    process.stdout.write("\u5FAE\u4FE1\u5DF2\u7ECF\u8FDE\u63A5\uFF0C\u65E0\u9700\u626B\u7801\u3002\n");
+  if (options.urlOnly) {
+    process.stdout.write(response.url);
     return 0;
   }
   try {
@@ -56,8 +56,13 @@ function parseArgs(argv) {
   if (argv.length === 0 || argv.includes("-h") || argv.includes("--help")) return "help";
   if (argv[0] !== "login") throw new Error(`\u672A\u77E5\u547D\u4EE4\uFF1A${argv[0] ?? ""}`);
   let socketPath;
+  let urlOnly = false;
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--url") {
+      urlOnly = true;
+      continue;
+    }
     if (argument === "--socket") {
       const value = argv[index + 1];
       if (!value) throw new Error("--socket \u9700\u8981\u4E00\u4E2A\u8DEF\u5F84");
@@ -72,7 +77,7 @@ function parseArgs(argv) {
     }
     throw new Error(`\u672A\u77E5\u53C2\u6570\uFF1A${argument ?? ""}`);
   }
-  return { command: "login", socketPath: resolveControlSocketPath(socketPath) };
+  return { command: "login", socketPath: resolveControlSocketPath(socketPath), urlOnly };
 }
 async function displayQr(url) {
   const parsed = new URL(url);
@@ -85,9 +90,10 @@ ${url}
 }
 function usage() {
   return [
-    "\u7528\u6CD5\uFF1Adsh-weixin login [--socket <path>]",
+    "\u7528\u6CD5\uFF1Adsh-weixin login [--url] [--socket <path>]",
     "",
-    "\u901A\u8FC7\u672C\u673A Unix Socket \u8BF7\u6C42\u6B63\u5728\u8FD0\u884C\u7684 DeepSeek Harness \u5FAE\u4FE1\u63D2\u4EF6\u663E\u793A\u4E8C\u7EF4\u7801\u3002",
+    "\u901A\u8FC7\u672C\u673A Unix Socket \u5F3A\u5236\u91CD\u65B0\u767B\u5F55\u5E76\u8986\u76D6\u5DF2\u4FDD\u5B58\u7684\u5FAE\u4FE1\u51ED\u636E\u3002",
+    "--url \u6210\u529F\u65F6\u53EA\u5411\u6807\u51C6\u8F93\u51FA\u5199\u5165\u4E8C\u7EF4\u7801 URL\uFF0C\u4E0D\u8F93\u51FA\u4E8C\u7EF4\u7801\u6216\u5176\u4ED6\u6587\u5B57\u3002",
     ""
   ].join("\n");
 }

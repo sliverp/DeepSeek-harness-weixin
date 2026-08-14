@@ -181,8 +181,6 @@ type WeixinLogin = typeof loginWithQr;
 type WeixinQrDisplay = (url: string) => Promise<void>;
 /** Outcome of an explicit login request from a Harness command surface. */
 type WeixinLoginRequest = {
-    kind: 'connected';
-} | {
     kind: 'qr-shown';
     reused: boolean;
     url: string;
@@ -202,6 +200,8 @@ declare class WeixinHarnessBridge {
     private api;
     private conversations;
     private monitorTask;
+    private monitorAbortController;
+    private disconnectTask;
     private connectionAttempt;
     private connected;
     private stopping;
@@ -210,8 +210,8 @@ declare class WeixinHarnessBridge {
     start(): Promise<void>;
     /** Begin connecting without making the containing Harness profile await QR login. */
     startInBackground(): void;
-    /** Start QR login on demand, or reprint the newest QR for an active attempt. */
-    requestLogin(signal?: AbortSignal): Promise<WeixinLoginRequest>;
+    /** Force QR login, replacing any connected credential after authorization succeeds. */
+    requestLogin(signal?: AbortSignal, displayQr?: boolean): Promise<WeixinLoginRequest>;
     /** Abort long-polling and await all owned messages and agents. */
     stop(): Promise<void>;
     private launchConnection;
@@ -219,6 +219,8 @@ declare class WeixinHarnessBridge {
     private resolveCredential;
     private monitor;
     private failureDelay;
+    private disconnectActive;
+    private performDisconnectActive;
     private dispatch;
     private allowed;
     private handleMessage;
@@ -337,9 +339,6 @@ declare function filterMarkdownForWeixin(text: string): string;
 
 type WeixinControlResponse = {
     ok: true;
-    kind: 'connected';
-} | {
-    ok: true;
     kind: 'qr';
     reused: boolean;
     url: string;
@@ -347,6 +346,10 @@ type WeixinControlResponse = {
     ok: false;
     error: string;
 };
+interface WeixinControlRequestOptions {
+    timeoutMs?: number;
+    urlOnly?: boolean;
+}
 interface WeixinControlLogger {
     info(message: string, ...args: unknown[]): void;
     warn(message: string, ...args: unknown[]): void;
@@ -365,7 +368,7 @@ declare class WeixinControlServer {
     private readonly clients;
     private ownsSocket;
     private stopping;
-    constructor(socketPath: string, requestLogin: (signal?: AbortSignal) => Promise<WeixinLoginRequest>, log: WeixinControlLogger);
+    constructor(socketPath: string, requestLogin: (signal?: AbortSignal, displayQr?: boolean) => Promise<WeixinLoginRequest>, log: WeixinControlLogger);
     /** Listen without making Harness Web await filesystem or socket setup. */
     startInBackground(): void;
     /** Close active clients and remove the socket during plugin teardown. */
@@ -376,7 +379,7 @@ declare class WeixinControlServer {
     private respond;
 }
 /** Ask the live plugin for a QR from a one-shot Linux CLI process. */
-declare function requestLoginFromControlSocket(socketPath: string, timeoutMs?: number): Promise<WeixinControlResponse>;
+declare function requestLoginFromControlSocket(socketPath: string, options?: WeixinControlRequestOptions | number): Promise<WeixinControlResponse>;
 
 /** Deterministic, non-identifying DSH session id for one Weixin user. */
 declare function sessionIdFor(accountId: string, message: Pick<WeixinMessage, 'from_user_id'>): string;
@@ -396,7 +399,7 @@ declare const inject: string[];
 
 interface WeixinBridgeLifecycle {
     startInBackground(): void;
-    requestLogin(signal?: AbortSignal): Promise<WeixinLoginRequest>;
+    requestLogin(signal?: AbortSignal, displayQr?: boolean): Promise<WeixinLoginRequest>;
     stop(): Promise<void>;
 }
 interface WeixinControlLifecycle {
@@ -414,4 +417,4 @@ declare const _default: {
     apply: typeof apply;
 };
 
-export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, sessionIdFor, truncateUtf8 };
+export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlRequestOptions, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, sessionIdFor, truncateUtf8 };

@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-weixin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Official Weixin iLink QR-login text and image bridge for DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",

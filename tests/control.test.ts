@@ -19,7 +19,7 @@ async function temporarySocketPath(): Promise<string> {
 describe('WeixinControlServer', () => {
   it('returns a fresh QR URL over an owner-only Unix socket', async () => {
     const socketPath = await temporarySocketPath()
-    const requestLogin = vi.fn(async () => ({
+    const requestLogin = vi.fn(async (_signal?: AbortSignal, _displayQr?: boolean) => ({
       kind: 'qr-shown' as const,
       reused: false,
       url: 'https://qr.example/from-cli',
@@ -41,14 +41,19 @@ describe('WeixinControlServer', () => {
       url: 'https://qr.example/from-cli',
     })
     expect(requestLogin).toHaveBeenCalledOnce()
+    expect(requestLogin.mock.calls[0]?.[1]).toBe(false)
 
     await server.stop()
     await expect(lstat(socketPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('reports an already connected channel without requesting another writer', async () => {
+  it('asks the bridge not to render when the client requests URL-only output', async () => {
     const socketPath = await temporarySocketPath()
-    const requestLogin = vi.fn(async () => ({ kind: 'connected' as const }))
+    const requestLogin = vi.fn(async (_signal?: AbortSignal, _displayQr?: boolean) => ({
+      kind: 'qr-shown' as const,
+      reused: false,
+      url: 'https://qr.example/url-only',
+    }))
     const server = new WeixinControlServer(
       socketPath,
       requestLogin,
@@ -57,10 +62,14 @@ describe('WeixinControlServer', () => {
     server.startInBackground()
     await vi.waitFor(async () => expect((await lstat(socketPath)).isSocket()).toBe(true))
 
-    await expect(requestLoginFromControlSocket(socketPath)).resolves.toEqual({
+    await expect(requestLoginFromControlSocket(socketPath, { urlOnly: true })).resolves.toEqual({
       ok: true,
-      kind: 'connected',
+      kind: 'qr',
+      reused: false,
+      url: 'https://qr.example/url-only',
     })
+    expect(requestLogin.mock.calls[0]?.[1]).toBe(false)
+
     await server.stop()
   })
 
@@ -70,7 +79,11 @@ describe('WeixinControlServer', () => {
     const logger = { info: vi.fn(), warn: vi.fn() }
     const server = new WeixinControlServer(
       directory,
-      vi.fn(async () => ({ kind: 'connected' as const })),
+      vi.fn(async () => ({
+        kind: 'qr-shown' as const,
+        reused: false,
+        url: 'https://qr.example/unreachable',
+      })),
       logger,
     )
 

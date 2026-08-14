@@ -3,7 +3,7 @@ import {
   defaultControlSocketPath,
   requestLoginFromControlSocket,
   resolveControlSocketPath
-} from "./chunk-2OXSSMUP.js";
+} from "./chunk-LVGDSBED.js";
 
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
@@ -704,8 +704,8 @@ import { createInterface } from "readline/promises";
 
 // src/protocol.ts
 import { createCipheriv, createDecipheriv, createHash as createHash2, randomBytes as randomBytes2 } from "crypto";
-var CHANNEL_VERSION = "0.2.2";
-var BOT_AGENT = "DeepSeek-Harness/0.2.2";
+var CHANNEL_VERSION = "0.2.3";
+var BOT_AGENT = "DeepSeek-Harness/0.2.3";
 var ILINK_APP_ID = "bot";
 var ILINK_APP_CLIENT_VERSION = 2 << 16 | 4 << 8 | 6;
 var DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -1503,39 +1503,40 @@ var WeixinHarnessBridge = class {
   api;
   conversations;
   monitorTask;
+  monitorAbortController;
+  disconnectTask;
   connectionAttempt;
   connected = false;
   stopping = false;
   /** Resolve or create a QR credential, verify it, and begin long-polling. */
   async start() {
     if (this.connected) return;
-    await this.launchConnection(false).task;
+    await this.launchConnection(false, true).task;
   }
   /** Begin connecting without making the containing Harness profile await QR login. */
   startInBackground() {
     if (this.connected || this.stopping) return;
-    this.launchConnection(false);
+    this.launchConnection(false, true);
   }
-  /** Start QR login on demand, or reprint the newest QR for an active attempt. */
-  async requestLogin(signal) {
+  /** Force QR login, replacing any connected credential after authorization succeeds. */
+  async requestLogin(signal, displayQr2 = true) {
     throwIfAborted2(signal);
     if (this.stopping) throw new Error("\u5FAE\u4FE1\u901A\u9053\u6B63\u5728\u505C\u6B62\uFF0C\u65E0\u6CD5\u53D1\u8D77\u626B\u7801");
-    if (this.connected) return { kind: "connected" };
     let attempt = this.connectionAttempt;
+    if (attempt !== void 0 && displayQr2) attempt.displayQr = true;
     if (attempt?.qrUrl !== void 0) {
-      await this.showQr(attempt.qrUrl);
+      if (displayQr2) await this.showQr(attempt.qrUrl);
       return { kind: "qr-shown", reused: true, url: attempt.qrUrl };
     }
-    if (attempt === void 0) attempt = this.launchConnection(true);
+    if (attempt === void 0) attempt = this.launchConnection(true, displayQr2);
     let readiness = await waitFor(attempt.ready, signal);
     if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
-    if (readiness.kind === "connected") return { kind: "connected" };
     if (!attempt.forceQr && !this.stopping) {
-      attempt = this.launchConnection(true);
+      attempt = this.launchConnection(true, displayQr2);
       readiness = await waitFor(attempt.ready, signal);
       if (readiness.kind === "qr") return { kind: "qr-shown", reused: false, url: readiness.url };
-      if (readiness.kind === "connected") return { kind: "connected" };
     }
+    if (readiness.kind === "connected") throw new Error("\u5FAE\u4FE1\u91CD\u65B0\u767B\u5F55\u6D41\u7A0B\u6CA1\u6709\u8FD4\u56DE\u4E8C\u7EF4\u7801");
     throw readiness.error;
   }
   /** Abort long-polling and await all owned messages and agents. */
@@ -1543,24 +1544,16 @@ var WeixinHarnessBridge = class {
     if (this.stopping) return;
     this.stopping = true;
     this.abortController.abort();
-    this.conversations?.cancelPendingApprovals();
     const connectionTask = this.connectionAttempt?.task;
     if (connectionTask !== void 0) await Promise.allSettled([connectionTask]);
-    if (this.monitorTask !== void 0) await this.monitorTask;
-    await Promise.allSettled(this.inFlight);
-    if (this.conversations !== void 0) await this.conversations.dispose();
-    if (this.api !== void 0) {
-      try {
-        await this.api.notifyStop();
-      } catch (error) {
-        this.log.warn("Weixin notifyStop failed during teardown: %s", String(error));
-      }
-    }
-    this.connected = false;
+    await this.disconnectActive();
   }
-  launchConnection(forceQr) {
+  launchConnection(forceQr, displayQr2) {
     if (this.stopping) throw new Error("\u5FAE\u4FE1\u901A\u9053\u6B63\u5728\u505C\u6B62\uFF0C\u65E0\u6CD5\u5EFA\u7ACB\u8FDE\u63A5");
-    if (this.connectionAttempt !== void 0) return this.connectionAttempt;
+    if (this.connectionAttempt !== void 0) {
+      if (displayQr2) this.connectionAttempt.displayQr = true;
+      return this.connectionAttempt;
+    }
     let resolveReady;
     const ready = new Promise((resolve) => {
       resolveReady = resolve;
@@ -1569,6 +1562,7 @@ var WeixinHarnessBridge = class {
       forceQr,
       ready,
       resolveReady,
+      displayQr: displayQr2,
       task: Promise.resolve()
     };
     attempt.task = this.connect(forceQr, attempt);
@@ -1582,10 +1576,14 @@ var WeixinHarnessBridge = class {
         attempt.resolveReady({ kind: "failed", error });
         if (this.connectionAttempt === attempt) this.connectionAttempt = void 0;
         if (!this.stopping) {
-          this.log.warn(
-            "Weixin channel remains offline: %s. Harness Web is unaffected; run /weixin-login to show a fresh QR code.",
-            String(error)
-          );
+          if (this.connected) {
+            this.log.warn("Weixin re-login failed; the existing connection remains active: %s", String(error));
+          } else {
+            this.log.warn(
+              "Weixin channel remains offline: %s. Harness Web is unaffected; run dsh-weixin login to show a fresh QR code.",
+              String(error)
+            );
+          }
         }
       }
     );
@@ -1593,6 +1591,8 @@ var WeixinHarnessBridge = class {
   }
   async connect(forceQr, attempt) {
     const credential = await this.resolveCredential(forceQr, attempt);
+    throwIfAborted2(this.abortController.signal);
+    await this.disconnectActive();
     throwIfAborted2(this.abortController.signal);
     const api = this.apiFactory(credential, this.config);
     const conversations = new ConversationManager(this.ctx, this.config, credential.accountId);
@@ -1614,9 +1614,13 @@ var WeixinHarnessBridge = class {
     this.api = api;
     this.conversations = conversations;
     this.connected = true;
+    const monitorAbortController = new AbortController();
+    this.monitorAbortController = monitorAbortController;
     this.log.info("Weixin iLink credential verified for account %s", shortId2(credential.accountId));
-    this.monitorTask = this.monitor(api, credential).catch((error) => {
-      if (!this.stopping) this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
+    this.monitorTask = this.monitor(api, credential, monitorAbortController.signal).catch((error) => {
+      if (!this.stopping && !monitorAbortController.signal.aborted) {
+        this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
+      }
     });
   }
   async resolveCredential(forceQr, attempt) {
@@ -1631,11 +1635,12 @@ var WeixinHarnessBridge = class {
     this.log.info(forceQr ? "Starting explicitly requested Weixin QR login" : "No Weixin credential found; starting official QR login");
     const credential = await this.login({
       timeoutMs: this.config.loginTimeoutMs,
+      existingTokens: this.credential === void 0 ? [] : [this.credential.token],
       signal: this.abortController.signal,
       callbacks: {
         showQr: async (url) => {
           attempt.qrUrl = url;
-          await this.showQr(url);
+          if (attempt.displayQr) await this.showQr(url);
           attempt.resolveReady({ kind: "qr", url });
         },
         status: (message) => this.log.info("%s", message)
@@ -1646,21 +1651,21 @@ var WeixinHarnessBridge = class {
     this.log.info("Weixin credential stored by the Harness credential provider");
     return credential;
   }
-  async monitor(api, credential) {
+  async monitor(api, credential, signal) {
     const cursorStore = new SyncCursorStore(resolveStatePath(this.config.statePath, credential.accountId));
     let cursor = await cursorStore.load();
     let timeoutMs = this.config.longPollTimeoutMs;
     let failures = 0;
-    while (!this.abortController.signal.aborted) {
+    while (!signal.aborted) {
       try {
-        const response = await api.getUpdates(cursor, timeoutMs, this.abortController.signal);
-        if (this.abortController.signal.aborted) return;
+        const response = await api.getUpdates(cursor, timeoutMs, signal);
+        if (signal.aborted) return;
         const code = response.errcode ?? response.ret ?? 0;
         if (code !== 0) {
           if (code === STALE_TOKEN_CODE) {
             this.log.error("Weixin credential is temporarily stale; pausing requests for %dms", this.config.staleTokenPauseMs);
             failures = 0;
-            await delay(this.config.staleTokenPauseMs, this.abortController.signal);
+            await delay(this.config.staleTokenPauseMs, signal);
             continue;
           }
           failures += 1;
@@ -1671,7 +1676,7 @@ var WeixinHarnessBridge = class {
             this.config.maxConsecutiveFailures,
             response.errmsg ?? "(no message)"
           );
-          await this.failureDelay(failures);
+          await this.failureDelay(failures, signal);
           if (failures >= this.config.maxConsecutiveFailures) failures = 0;
           continue;
         }
@@ -1685,7 +1690,7 @@ var WeixinHarnessBridge = class {
         }
         for (const message of response.msgs ?? []) await this.dispatch(message, api);
       } catch (error) {
-        if (this.abortController.signal.aborted) return;
+        if (signal.aborted) return;
         failures += 1;
         this.log.error(
           "Weixin getUpdates transport failure (%d/%d): %s",
@@ -1693,14 +1698,48 @@ var WeixinHarnessBridge = class {
           this.config.maxConsecutiveFailures,
           String(error)
         );
-        await this.failureDelay(failures);
+        await this.failureDelay(failures, signal);
         if (failures >= this.config.maxConsecutiveFailures) failures = 0;
       }
     }
   }
-  async failureDelay(failures) {
+  async failureDelay(failures, signal) {
     const ms = failures >= this.config.maxConsecutiveFailures ? this.config.backoffDelayMs : this.config.retryDelayMs;
-    await delay(ms, this.abortController.signal);
+    await delay(ms, signal);
+  }
+  disconnectActive() {
+    if (this.disconnectTask !== void 0) return this.disconnectTask;
+    const task = this.performDisconnectActive();
+    this.disconnectTask = task;
+    void task.finally(() => {
+      if (this.disconnectTask === task) this.disconnectTask = void 0;
+    }).catch(() => void 0);
+    return task;
+  }
+  async performDisconnectActive() {
+    const monitorAbortController = this.monitorAbortController;
+    const monitorTask = this.monitorTask;
+    const conversations = this.conversations;
+    const api = this.api;
+    const credential = this.credential;
+    this.connected = false;
+    monitorAbortController?.abort(new Error("\u5FAE\u4FE1\u8FDE\u63A5\u6B63\u5728\u5207\u6362"));
+    conversations?.cancelPendingApprovals();
+    if (monitorTask !== void 0) await monitorTask;
+    await Promise.allSettled(this.inFlight);
+    if (conversations !== void 0) await conversations.dispose();
+    if (api !== void 0) {
+      try {
+        await api.notifyStop();
+      } catch (error) {
+        this.log.warn("Weixin notifyStop failed during teardown: %s", String(error));
+      }
+    }
+    if (this.monitorAbortController === monitorAbortController) this.monitorAbortController = void 0;
+    if (this.monitorTask === monitorTask) this.monitorTask = void 0;
+    if (this.conversations === conversations) this.conversations = void 0;
+    if (this.api === api) this.api = void 0;
+    if (this.credential === credential) this.credential = void 0;
   }
   async dispatch(message, api) {
     if (message.message_type !== void 0 && message.message_type !== MessageType.USER) return;
@@ -2009,16 +2048,13 @@ function apply(ctx, config) {
   const bridge = new WeixinHarnessBridge(ctx, config);
   const control = new WeixinControlServer(
     resolveControlSocketPath(config.controlSocketPath),
-    (signal) => bridge.requestLogin(signal),
+    (signal, displayQr2) => bridge.requestLogin(signal, displayQr2),
     ctx.logger("deepseek-harness-weixin")
   );
   mountBridge(ctx, bridge, control);
 }
 var index_default = { name, inject, Config, apply };
 function loginCommandResult(result) {
-  if (result.kind === "connected") {
-    return { kind: "success", text: "\u5FAE\u4FE1\u5DF2\u7ECF\u8FDE\u63A5\uFF0C\u65E0\u9700\u626B\u7801\u3002" };
-  }
   return {
     kind: "success",
     text: result.reused ? "\u5F53\u524D\u626B\u7801\u6D41\u7A0B\u4ECD\u5728\u8FDB\u884C\uFF0C\u6700\u65B0\u4E8C\u7EF4\u7801\u5DF2\u91CD\u65B0\u8F93\u51FA\u5230\u8FD0\u884C pnpm dsh web \u7684\u7EC8\u7AEF\u3002" : "\u65B0\u7684\u5FAE\u4FE1\u4E8C\u7EF4\u7801\u5DF2\u8F93\u51FA\u5230\u8FD0\u884C pnpm dsh web \u7684\u7EC8\u7AEF\uFF0C\u8BF7\u4F7F\u7528\u5FAE\u4FE1\u626B\u63CF\u5E76\u786E\u8BA4\u8FDE\u63A5\u3002"

@@ -37,8 +37,7 @@ export type WeixinQrDisplay = (url: string) => Promise<void>
 
 /** Outcome of an explicit login request from a Harness command surface. */
 export type WeixinLoginRequest =
-  | { kind: 'connected' }
-  | { kind: 'qr-shown'; reused: boolean; url: string }
+  { kind: 'qr-shown'; reused: boolean; url: string }
 
 type ConnectionReadiness =
   | { kind: 'connected' }
@@ -49,6 +48,7 @@ interface ConnectionAttempt {
   readonly forceQr: boolean
   readonly ready: Promise<ConnectionReadiness>
   readonly resolveReady: (readiness: ConnectionReadiness) => void
+  displayQr: boolean
   task: Promise<void>
   qrUrl?: string
 }
@@ -63,6 +63,8 @@ export class WeixinHarnessBridge {
   private api: WeixinApiPort | undefined
   private conversations: ConversationManager | undefined
   private monitorTask: Promise<void> | undefined
+  private monitorAbortController: AbortController | undefined
+  private disconnectTask: Promise<void> | undefined
   private connectionAttempt: ConnectionAttempt | undefined
   private connected = false
   private stopping = false
@@ -89,40 +91,39 @@ export class WeixinHarnessBridge {
   /** Resolve or create a QR credential, verify it, and begin long-polling. */
   async start(): Promise<void> {
     if (this.connected) return
-    await this.launchConnection(false).task
+    await this.launchConnection(false, true).task
   }
 
   /** Begin connecting without making the containing Harness profile await QR login. */
   startInBackground(): void {
     if (this.connected || this.stopping) return
-    this.launchConnection(false)
+    this.launchConnection(false, true)
   }
 
-  /** Start QR login on demand, or reprint the newest QR for an active attempt. */
-  async requestLogin(signal?: AbortSignal): Promise<WeixinLoginRequest> {
+  /** Force QR login, replacing any connected credential after authorization succeeds. */
+  async requestLogin(signal?: AbortSignal, displayQr = true): Promise<WeixinLoginRequest> {
     throwIfAborted(signal)
     if (this.stopping) throw new Error('微信通道正在停止，无法发起扫码')
-    if (this.connected) return { kind: 'connected' }
 
     let attempt = this.connectionAttempt
+    if (attempt !== undefined && displayQr) attempt.displayQr = true
     if (attempt?.qrUrl !== undefined) {
-      await this.showQr(attempt.qrUrl)
+      if (displayQr) await this.showQr(attempt.qrUrl)
       return { kind: 'qr-shown', reused: true, url: attempt.qrUrl }
     }
 
-    if (attempt === undefined) attempt = this.launchConnection(true)
+    if (attempt === undefined) attempt = this.launchConnection(true, displayQr)
     let readiness = await waitFor(attempt.ready, signal)
     if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
-    if (readiness.kind === 'connected') return { kind: 'connected' }
 
-    // A normal background attempt can fail on a stale stored credential before
-    // reaching QR login. One explicit command then gets a fresh QR immediately.
+    // If a normal background restore wins the race, explicit login still starts
+    // a fresh QR flow so the persisted credential can be replaced.
     if (!attempt.forceQr && !this.stopping) {
-      attempt = this.launchConnection(true)
+      attempt = this.launchConnection(true, displayQr)
       readiness = await waitFor(attempt.ready, signal)
       if (readiness.kind === 'qr') return { kind: 'qr-shown', reused: false, url: readiness.url }
-      if (readiness.kind === 'connected') return { kind: 'connected' }
     }
+    if (readiness.kind === 'connected') throw new Error('微信重新登录流程没有返回二维码')
     throw readiness.error
   }
 
@@ -131,25 +132,17 @@ export class WeixinHarnessBridge {
     if (this.stopping) return
     this.stopping = true
     this.abortController.abort()
-    this.conversations?.cancelPendingApprovals()
     const connectionTask = this.connectionAttempt?.task
     if (connectionTask !== undefined) await Promise.allSettled([connectionTask])
-    if (this.monitorTask !== undefined) await this.monitorTask
-    await Promise.allSettled(this.inFlight)
-    if (this.conversations !== undefined) await this.conversations.dispose()
-    if (this.api !== undefined) {
-      try {
-        await this.api.notifyStop()
-      } catch (error) {
-        this.log.warn('Weixin notifyStop failed during teardown: %s', String(error))
-      }
-    }
-    this.connected = false
+    await this.disconnectActive()
   }
 
-  private launchConnection(forceQr: boolean): ConnectionAttempt {
+  private launchConnection(forceQr: boolean, displayQr: boolean): ConnectionAttempt {
     if (this.stopping) throw new Error('微信通道正在停止，无法建立连接')
-    if (this.connectionAttempt !== undefined) return this.connectionAttempt
+    if (this.connectionAttempt !== undefined) {
+      if (displayQr) this.connectionAttempt.displayQr = true
+      return this.connectionAttempt
+    }
 
     let resolveReady!: (readiness: ConnectionReadiness) => void
     const ready = new Promise<ConnectionReadiness>(resolve => { resolveReady = resolve })
@@ -157,6 +150,7 @@ export class WeixinHarnessBridge {
       forceQr,
       ready,
       resolveReady,
+      displayQr,
       task: Promise.resolve(),
     }
     attempt.task = this.connect(forceQr, attempt)
@@ -170,10 +164,14 @@ export class WeixinHarnessBridge {
         attempt.resolveReady({ kind: 'failed', error })
         if (this.connectionAttempt === attempt) this.connectionAttempt = undefined
         if (!this.stopping) {
-          this.log.warn(
-            'Weixin channel remains offline: %s. Harness Web is unaffected; run /weixin-login to show a fresh QR code.',
-            String(error),
-          )
+          if (this.connected) {
+            this.log.warn('Weixin re-login failed; the existing connection remains active: %s', String(error))
+          } else {
+            this.log.warn(
+              'Weixin channel remains offline: %s. Harness Web is unaffected; run dsh-weixin login to show a fresh QR code.',
+              String(error),
+            )
+          }
         }
       },
     )
@@ -182,6 +180,8 @@ export class WeixinHarnessBridge {
 
   private async connect(forceQr: boolean, attempt: ConnectionAttempt): Promise<void> {
     const credential = await this.resolveCredential(forceQr, attempt)
+    throwIfAborted(this.abortController.signal)
+    await this.disconnectActive()
     throwIfAborted(this.abortController.signal)
     const api = this.apiFactory(credential, this.config)
     const conversations = new ConversationManager(this.ctx, this.config, credential.accountId)
@@ -204,9 +204,13 @@ export class WeixinHarnessBridge {
     this.api = api
     this.conversations = conversations
     this.connected = true
+    const monitorAbortController = new AbortController()
+    this.monitorAbortController = monitorAbortController
     this.log.info('Weixin iLink credential verified for account %s', shortId(credential.accountId))
-    this.monitorTask = this.monitor(api, credential).catch(error => {
-      if (!this.stopping) this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
+    this.monitorTask = this.monitor(api, credential, monitorAbortController.signal).catch(error => {
+      if (!this.stopping && !monitorAbortController.signal.aborted) {
+        this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
+      }
     })
   }
 
@@ -225,11 +229,12 @@ export class WeixinHarnessBridge {
       : 'No Weixin credential found; starting official QR login')
     const credential = await this.login({
       timeoutMs: this.config.loginTimeoutMs,
+      existingTokens: this.credential === undefined ? [] : [this.credential.token],
       signal: this.abortController.signal,
       callbacks: {
         showQr: async url => {
           attempt.qrUrl = url
-          await this.showQr(url)
+          if (attempt.displayQr) await this.showQr(url)
           attempt.resolveReady({ kind: 'qr', url })
         },
         status: message => this.log.info('%s', message),
@@ -241,22 +246,22 @@ export class WeixinHarnessBridge {
     return credential
   }
 
-  private async monitor(api: WeixinApiPort, credential: WeixinCredential): Promise<void> {
+  private async monitor(api: WeixinApiPort, credential: WeixinCredential, signal: AbortSignal): Promise<void> {
     const cursorStore = new SyncCursorStore(resolveStatePath(this.config.statePath, credential.accountId))
     let cursor = await cursorStore.load()
     let timeoutMs = this.config.longPollTimeoutMs
     let failures = 0
 
-    while (!this.abortController.signal.aborted) {
+    while (!signal.aborted) {
       try {
-        const response = await api.getUpdates(cursor, timeoutMs, this.abortController.signal)
-        if (this.abortController.signal.aborted) return
+        const response = await api.getUpdates(cursor, timeoutMs, signal)
+        if (signal.aborted) return
         const code = response.errcode ?? response.ret ?? 0
         if (code !== 0) {
           if (code === STALE_TOKEN_CODE) {
             this.log.error('Weixin credential is temporarily stale; pausing requests for %dms', this.config.staleTokenPauseMs)
             failures = 0
-            await delay(this.config.staleTokenPauseMs, this.abortController.signal)
+            await delay(this.config.staleTokenPauseMs, signal)
             continue
           }
           failures += 1
@@ -267,7 +272,7 @@ export class WeixinHarnessBridge {
             this.config.maxConsecutiveFailures,
             response.errmsg ?? '(no message)',
           )
-          await this.failureDelay(failures)
+          await this.failureDelay(failures, signal)
           if (failures >= this.config.maxConsecutiveFailures) failures = 0
           continue
         }
@@ -281,7 +286,7 @@ export class WeixinHarnessBridge {
         }
         for (const message of response.msgs ?? []) await this.dispatch(message, api)
       } catch (error) {
-        if (this.abortController.signal.aborted) return
+        if (signal.aborted) return
         failures += 1
         this.log.error(
           'Weixin getUpdates transport failure (%d/%d): %s',
@@ -289,17 +294,53 @@ export class WeixinHarnessBridge {
           this.config.maxConsecutiveFailures,
           String(error),
         )
-        await this.failureDelay(failures)
+        await this.failureDelay(failures, signal)
         if (failures >= this.config.maxConsecutiveFailures) failures = 0
       }
     }
   }
 
-  private async failureDelay(failures: number): Promise<void> {
+  private async failureDelay(failures: number, signal: AbortSignal): Promise<void> {
     const ms = failures >= this.config.maxConsecutiveFailures
       ? this.config.backoffDelayMs
       : this.config.retryDelayMs
-    await delay(ms, this.abortController.signal)
+    await delay(ms, signal)
+  }
+
+  private disconnectActive(): Promise<void> {
+    if (this.disconnectTask !== undefined) return this.disconnectTask
+    const task = this.performDisconnectActive()
+    this.disconnectTask = task
+    void task.finally(() => {
+      if (this.disconnectTask === task) this.disconnectTask = undefined
+    }).catch(() => undefined)
+    return task
+  }
+
+  private async performDisconnectActive(): Promise<void> {
+    const monitorAbortController = this.monitorAbortController
+    const monitorTask = this.monitorTask
+    const conversations = this.conversations
+    const api = this.api
+    const credential = this.credential
+    this.connected = false
+    monitorAbortController?.abort(new Error('微信连接正在切换'))
+    conversations?.cancelPendingApprovals()
+    if (monitorTask !== undefined) await monitorTask
+    await Promise.allSettled(this.inFlight)
+    if (conversations !== undefined) await conversations.dispose()
+    if (api !== undefined) {
+      try {
+        await api.notifyStop()
+      } catch (error) {
+        this.log.warn('Weixin notifyStop failed during teardown: %s', String(error))
+      }
+    }
+    if (this.monitorAbortController === monitorAbortController) this.monitorAbortController = undefined
+    if (this.monitorTask === monitorTask) this.monitorTask = undefined
+    if (this.conversations === conversations) this.conversations = undefined
+    if (this.api === api) this.api = undefined
+    if (this.credential === credential) this.credential = undefined
   }
 
   private async dispatch(message: WeixinMessage, api: WeixinApiPort): Promise<void> {

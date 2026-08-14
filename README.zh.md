@@ -51,13 +51,21 @@ pnpm dsh web
 
 启动 `pnpm dsh web` 时，插件只会恢复已有凭据；没有凭据时保持离线，不会自动创建二维码，也不会阻塞或关闭 Harness Web。
 
-需要主动扫码或重新显示当前二维码时，另开一个 Linux 终端运行：
+需要扫码登录或更换当前微信账号时，另开一个 Linux 终端运行：
 
 ```sh
 pnpm dsh plugin --profile web exec dsh-weixin login
 ```
 
-这个命令通过仅当前用户可访问的本机 Unix Socket 联系正在运行的插件，并把新二维码或当前扫码流程的最新二维码显示在执行命令的终端。它不会重启 Web、不会等待扫码完成，也不会把备用链接写入 session。扫码流程最终超时后，再次执行即可开始全新流程。Web 中的 `/weixin-login` 也保留为辅助入口，但不是使用命令行扫码的前提。
+这个命令即使微信已经连接也会强制发起重新登录，不再返回“微信已经连接，无需扫码”。扫码确认前旧连接继续工作；确认成功后，插件会覆盖 `WEIXIN_ILINK_CREDENTIAL` 并热切换到新连接。命令通过仅当前用户可访问的本机 Unix Socket 联系运行中的插件，并把新二维码或当前扫码流程的最新二维码显示在执行命令的终端。它不会重启 Web、不会等待扫码完成，也不会把备用链接写入 session。扫码流程最终超时后，再次执行即可开始全新流程。
+
+只需要二维码 URL（例如交给其他脚本）时使用：
+
+```sh
+pnpm --silent dsh plugin --profile web exec dsh-weixin login --url
+```
+
+成功时，该模式的标准输出严格等于 URL 本身：不渲染二维码、不输出提示文字，也不附加换行；错误仍写入标准错误。这里的 `--silent` 用于关闭 pnpm 自己输出的 `$ node ...` 脚本提示。Web 中的 `/weixin-login` 也保留为辅助入口，但不是使用命令行扫码的前提。
 
 不要转发二维码备用链接，也不要复制或提交保存后的 JSON 凭据；两者都能授权访问已连接的 ClawBot。
 
@@ -128,7 +136,7 @@ session ID namespace 已升级为 `weixin-v3-single-...`。已有 `weixin-v1-sin
 
 `/new` 和 `/reset` 由微信通道处理：如当前 Agent 正在运行，会先取消并等待其闭合，然后创建新的持久 Harness session。旧 session 不会删除，仍可在 Web 中恢复或查看。
 
-`/weixin-login` 是 Linux CLI 之外的辅助入口，可在微信尚未连接时从 Web 主动拉起扫码；它不会进入模型。其他语法合法的斜杠命令会调用 `ctx.commands.execute(agent, line, signal)`，而不是作为用户文字交给模型；因此会产生 Harness 原生的 `command/run` 和 `command/done` 事件。实际命令目录取决于当前 Harness 组合，通常包括 `/plan`、`/compact`、`/permission`、`/goal`、`/feedback` 和 `/export`。未知或格式错误的斜杠命令会直接返回命令提示，同样不会进入模型。
+`/weixin-login` 是 Linux CLI 之外的辅助入口，可从 Web 强制拉起重新扫码；它不会进入模型。其他语法合法的斜杠命令会调用 `ctx.commands.execute(agent, line, signal)`，而不是作为用户文字交给模型；因此会产生 Harness 原生的 `command/run` 和 `command/done` 事件。实际命令目录取决于当前 Harness 组合，通常包括 `/plan`、`/compact`、`/permission`、`/goal`、`/feedback` 和 `/export`。未知或格式错误的斜杠命令会直接返回命令提示，同样不会进入模型。
 
 ## Markdown 兼容性
 
@@ -150,7 +158,7 @@ pong — DeepSeek Harness 微信机器人已连接。
 
 ## 重新登录
 
-通过 Harness 凭据设置界面删除 `WEIXIN_ILINK_CREDENTIAL`，再重启配置，插件就会生成新二维码。如果微信提示 ClawBot 已绑定其他本地实例，请先在微信中解除旧连接。
+无需先删除凭据，直接运行 `pnpm dsh plugin --profile web exec dsh-weixin login` 即可强制重新扫码并覆盖 `WEIXIN_ILINK_CREDENTIAL`。如果微信提示 ClawBot 已绑定其他本地实例，请先在微信中解除旧连接。
 
 ## 开发
 

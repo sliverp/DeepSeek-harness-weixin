@@ -30,13 +30,13 @@ export { loginWithQr } from './login.js'
 export { filterMarkdownForWeixin, StreamingMarkdownFilter } from './markdown-filter.js'
 export { WeixinApiClient } from './protocol.js'
 export { defaultControlSocketPath, requestLoginFromControlSocket, resolveControlSocketPath, WeixinControlServer } from './control.js'
-export type { WeixinControlResponse } from './control.js'
+export type { WeixinControlRequestOptions, WeixinControlResponse } from './control.js'
 export { parseCredential } from './types.js'
 export { SeenMessageIds, sessionIdFor, truncateUtf8 } from './util.js'
 
 interface WeixinBridgeLifecycle {
   startInBackground(): void
-  requestLogin(signal?: AbortSignal): Promise<WeixinLoginRequest>
+  requestLogin(signal?: AbortSignal, displayQr?: boolean): Promise<WeixinLoginRequest>
   stop(): Promise<void>
 }
 
@@ -86,7 +86,7 @@ export function apply(ctx: Context, config: WeixinConfig): void {
   const bridge = new WeixinHarnessBridge(ctx, config)
   const control = new WeixinControlServer(
     resolveControlSocketPath(config.controlSocketPath),
-    signal => bridge.requestLogin(signal),
+    (signal, displayQr) => bridge.requestLogin(signal, displayQr),
     ctx.logger('deepseek-harness-weixin'),
   )
   mountBridge(ctx, bridge, control)
@@ -95,9 +95,6 @@ export function apply(ctx: Context, config: WeixinConfig): void {
 export default { name, inject, Config, apply }
 
 function loginCommandResult(result: WeixinLoginRequest) {
-  if (result.kind === 'connected') {
-    return { kind: 'success' as const, text: '微信已经连接，无需扫码。' }
-  }
   return {
     kind: 'success' as const,
     text: result.reused

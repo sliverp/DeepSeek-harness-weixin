@@ -51,13 +51,21 @@ pnpm dsh web
 
 When `pnpm dsh web` starts, the plugin only restores an existing credential. Without one, the channel stays offline: it does not create a QR automatically and never blocks or stops Harness Web.
 
-To start login explicitly or show the current QR again, open another Linux shell and run:
+To log in or replace the currently connected Weixin account, open another Linux shell and run:
 
 ```sh
 pnpm dsh plugin --profile web exec dsh-weixin login
 ```
 
-The command contacts the live plugin over an owner-only local Unix socket and displays a fresh QR, or the newest QR from an active attempt, in the shell that ran the command. It neither restarts Web nor waits for authorization, and no fallback URL is persisted in a session. Run it again after an attempt times out to begin a new attempt. Web `/weixin-login` remains available as a convenience, but is not required for CLI login.
+The command forces a new login even when Weixin is already connected; it no longer exits with an “already connected” notice. The old connection remains active until the scan is confirmed, then the plugin overwrites `WEIXIN_ILINK_CREDENTIAL` and hot-switches connections. It contacts the live plugin over an owner-only local Unix socket and displays a fresh QR, or the newest QR from an active attempt, in the invoking shell. It neither restarts Web nor waits for authorization, and no fallback URL is persisted in a session.
+
+Use URL-only mode when another script needs the QR URL:
+
+```sh
+pnpm --silent dsh plugin --profile web exec dsh-weixin login --url
+```
+
+On success, stdout is exactly the URL: no QR rendering, status text, or trailing newline. Errors still go to stderr. `--silent` suppresses pnpm's own `$ node ...` script banner. Run the command again after an attempt times out to begin a new attempt. Web `/weixin-login` remains available as a convenience, but is not required for CLI login.
 
 Do not share the QR fallback URL or the stored JSON credential. Both authorize access to the linked ClawBot.
 
@@ -128,7 +136,7 @@ Session IDs now use the `weixin-v3-single-...` namespace. Existing `weixin-v1-si
 
 `/new` and `/reset` are channel-owned. If the current Agent is running, the channel cancels it and waits for the turn to close before creating a fresh persistent Harness session. The old session is retained for Web inspection or resume.
 
-`/weixin-login` is a secondary entry point alongside the Linux CLI; it can start QR login from Web while Weixin is disconnected and never enters the model. Every other syntactically valid slash command is sent to `ctx.commands.execute(agent, line, signal)`, never to the model, and therefore records native `command/run` and `command/done` events. The effective catalog depends on the Harness composition and commonly includes `/plan`, `/compact`, `/permission`, `/goal`, `/feedback`, and `/export`. Unknown or malformed slash commands return command guidance without entering the model.
+`/weixin-login` is a secondary entry point alongside the Linux CLI; it can force a fresh QR login from Web and never enters the model. Every other syntactically valid slash command is sent to `ctx.commands.execute(agent, line, signal)`, never to the model, and therefore records native `command/run` and `command/done` events. The effective catalog depends on the Harness composition and commonly includes `/plan`, `/compact`, `/permission`, `/goal`, `/feedback`, and `/export`. Unknown or malformed slash commands return command guidance without entering the model.
 
 ## Markdown compatibility
 
@@ -150,7 +158,7 @@ To verify tool approval, send “我当前有啥文件？”. After receiving `B
 
 ## Relogin
 
-Remove the `WEIXIN_ILINK_CREDENTIAL` entry through the Harness credential settings surface and restart the profile. A new QR code will be generated. If Weixin reports that ClawBot is already bound to another local instance, remove the old connection in Weixin first.
+Run `pnpm dsh plugin --profile web exec dsh-weixin login` to force a fresh scan and overwrite `WEIXIN_ILINK_CREDENTIAL`; deleting the old credential first is unnecessary. If Weixin reports that ClawBot is already bound to another local instance, remove the old connection in Weixin first.
 
 ## Development
 

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 interface CliOptions {
   command: 'login'
   socketPath: string
+  urlOnly: boolean
 }
 
 /** Run the plugin-owned Linux control CLI. */
@@ -26,7 +27,7 @@ export async function run(argv: readonly string[]): Promise<number> {
 
   let response
   try {
-    response = await requestLoginFromControlSocket(options.socketPath)
+    response = await requestLoginFromControlSocket(options.socketPath, { urlOnly: options.urlOnly })
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     const detail = code === 'ENOENT' || code === 'ECONNREFUSED'
@@ -40,8 +41,8 @@ export async function run(argv: readonly string[]): Promise<number> {
     process.stderr.write(`微信扫码启动失败：${response.error}\n`)
     return 1
   }
-  if (response.kind === 'connected') {
-    process.stdout.write('微信已经连接，无需扫码。\n')
+  if (options.urlOnly) {
+    process.stdout.write(response.url)
     return 0
   }
 
@@ -62,8 +63,13 @@ function parseArgs(argv: readonly string[]): CliOptions | 'help' {
   if (argv[0] !== 'login') throw new Error(`未知命令：${argv[0] ?? ''}`)
 
   let socketPath: string | undefined
+  let urlOnly = false
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index]
+    if (argument === '--url') {
+      urlOnly = true
+      continue
+    }
     if (argument === '--socket') {
       const value = argv[index + 1]
       if (!value) throw new Error('--socket 需要一个路径')
@@ -78,7 +84,7 @@ function parseArgs(argv: readonly string[]): CliOptions | 'help' {
     }
     throw new Error(`未知参数：${argument ?? ''}`)
   }
-  return { command: 'login', socketPath: resolveControlSocketPath(socketPath) }
+  return { command: 'login', socketPath: resolveControlSocketPath(socketPath), urlOnly }
 }
 
 async function displayQr(url: string): Promise<void> {
@@ -91,9 +97,10 @@ async function displayQr(url: string): Promise<void> {
 
 function usage(): string {
   return [
-    '用法：dsh-weixin login [--socket <path>]',
+    '用法：dsh-weixin login [--url] [--socket <path>]',
     '',
-    '通过本机 Unix Socket 请求正在运行的 DeepSeek Harness 微信插件显示二维码。',
+    '通过本机 Unix Socket 强制重新登录并覆盖已保存的微信凭据。',
+    '--url 成功时只向标准输出写入二维码 URL，不输出二维码或其他文字。',
     '',
   ].join('\n')
 }

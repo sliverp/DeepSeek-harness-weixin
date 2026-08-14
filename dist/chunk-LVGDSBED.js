@@ -115,8 +115,8 @@ var WeixinControlServer = class {
       return { ok: false, error: "invalid control request" };
     }
     if (!isLoginRequest(request)) return { ok: false, error: "unknown control command" };
-    const result = await this.requestLogin(signal);
-    return result.kind === "connected" ? { ok: true, kind: "connected" } : { ok: true, kind: "qr", reused: result.reused, url: result.url };
+    const result = await this.requestLogin(signal, false);
+    return { ok: true, kind: "qr", reused: result.reused, url: result.url };
   }
   respond(socket, response) {
     if (socket.destroyed) return;
@@ -124,12 +124,14 @@ var WeixinControlServer = class {
 `);
   }
 };
-function requestLoginFromControlSocket(socketPath, timeoutMs = DEFAULT_CLIENT_TIMEOUT_MS) {
+function requestLoginFromControlSocket(socketPath, options = {}) {
   if (!isAbsolute(socketPath)) return Promise.reject(new Error("control socket path must be absolute"));
+  const resolvedOptions = typeof options === "number" ? { timeoutMs: options } : options;
   return new Promise((resolveResponse, rejectResponse) => {
     const socket = createConnection(socketPath);
     let input = "";
     let settled = false;
+    const timeoutMs = resolvedOptions.timeoutMs ?? DEFAULT_CLIENT_TIMEOUT_MS;
     const timer = setTimeout(() => settleError(new Error(`control request timed out after ${timeoutMs}ms`)), timeoutMs);
     const cleanup = () => {
       clearTimeout(timer);
@@ -149,7 +151,11 @@ function requestLoginFromControlSocket(socketPath, timeoutMs = DEFAULT_CLIENT_TI
       resolveResponse(value);
     };
     socket.setEncoding("utf8");
-    socket.once("connect", () => socket.write('{"command":"login"}\n'));
+    socket.once("connect", () => socket.write(`${JSON.stringify({
+      command: "login",
+      ...resolvedOptions.urlOnly === true ? { urlOnly: true } : {}
+    })}
+`));
     socket.once("error", settleError);
     socket.on("data", (chunk) => {
       input += chunk;
@@ -171,7 +177,7 @@ function requestLoginFromControlSocket(socketPath, timeoutMs = DEFAULT_CLIENT_TI
   });
 }
 function isLoginRequest(value) {
-  return typeof value === "object" && value !== null && value.command === "login";
+  return typeof value === "object" && value !== null && value.command === "login" && (value.urlOnly === void 0 || typeof value.urlOnly === "boolean");
 }
 function parseControlResponse(value) {
   if (typeof value !== "object" || value === null) throw new Error("invalid control response");
@@ -179,7 +185,6 @@ function parseControlResponse(value) {
   if (response.ok === false && typeof response.error === "string") {
     return { ok: false, error: response.error };
   }
-  if (response.ok === true && response.kind === "connected") return { ok: true, kind: "connected" };
   if (response.ok === true && response.kind === "qr" && typeof response.url === "string" && typeof response.reused === "boolean") {
     return { ok: true, kind: "qr", reused: response.reused, url: response.url };
   }
@@ -245,4 +250,4 @@ export {
   WeixinControlServer,
   requestLoginFromControlSocket
 };
-//# sourceMappingURL=chunk-2OXSSMUP.js.map
+//# sourceMappingURL=chunk-LVGDSBED.js.map
