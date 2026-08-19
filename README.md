@@ -13,17 +13,23 @@ This is a DeepSeek Harness plugin, not an OpenClaw adapter. The iLink protocol, 
 - Restart-safe long-poll cursor with atomic owner-only storage.
 - Persistent Harness conversation per Weixin user.
 - Full Harness Agent preset lifecycle, including structured tool execution and live Web-session reuse.
-- Inbound text, voice transcription, quoted context, and encrypted images.
-- Outbound text and AES-encrypted CDN image upload.
+- Inbound text, voice transcription, quoted context, encrypted images, and encrypted generic files.
+- Outbound text plus AES-encrypted CDN image and file upload.
 - Tencent-compatible partial Markdown rendering for outbound text.
 - Automatic text-only fallback when the selected model cannot inspect images.
 - Allowlist/disabled access policy, bounded concurrency, deduplication, retries, and clean teardown.
-- `/bot-ping`, `/bot-help`, `/bot-status`, `/bot-image-test`, and `/bot-cancel` diagnostics.
+- `/bot-ping`, `/bot-help`, `/bot-status`, `/bot-image-test`, `/bot-file-test`, and `/bot-cancel` diagnostics.
 - On-demand QR login that never blocks Harness Web and can authorize independently before Web starts.
 - Same-chat `/approve <code>` and `/reject <code>` decisions for tool approval requests.
 - Persistent `/new` and `/reset` sessions plus direct dispatch of other Harness slash commands.
 
 The official ClawBot/iLink integration currently supports private chats only.
+
+## Requirements
+
+- Node.js 22.19 or later
+- pnpm 10.33.4
+- DeepSeek Harness 0.1.0-rc.7 or later
 
 ## Prerequisite: ClawBot access
 
@@ -108,6 +114,11 @@ Override the row in `~/.dsh/profiles/web/cordis.patch.yml` when needed:
     approvalTimeoutMs: 240000
     maxInFlightMessages: 8
     maxReplyImages: 4
+    maxInboundFiles: 10
+    maxInboundFileBytes: 31457280
+    maxInboundMessageFileBytes: 104857600
+    maxReplyFiles: 5
+    maxOutboundFileBytes: 31457280
 ```
 
 When `statePath` is empty, the cursor is stored under `~/.dsh/weixin/`. The plugin creates the file atomically with mode `0600`.
@@ -117,6 +128,10 @@ When `controlSocketPath` is empty, it defaults to `~/.dsh/weixin/control.sock`; 
 `autoLogin` defaults to `false`: without a credential, the channel stays offline until the Linux command above requests QR login. Set it to `true` to restore automatic background QR display during Web startup; neither setting allows QR login to block Web.
 
 `imageInputMode` defaults to `auto`: image-capable models receive a durable image block, while text-only models receive attachment metadata instead of failing the turn. Use `always` only with a route known to accept images, or `never` to force the fallback.
+
+Inbound iLink `FILE` items are downloaded and AES-decrypted before the model turn. Filenames are reduced to safe leaves, and each message receives a private directory under `<cwd>/.dsh-weixin/inbox/`. The model receives the saved relative and absolute paths and must use normal filesystem tools to inspect the file; its contents are not executed or silently copied into the prompt. Defaults allow 10 files, 30 MiB per file, and 100 MiB total per message.
+
+When the model intentionally returns a workspace file, it includes an explicit Markdown link in the final answer. The plugin resolves the canonical path, rejects missing files, directories, symlink escapes, empty files, and targets outside the session `cwd`, then uses the official `media_type=FILE` encrypted upload and `FILE` message item. Defaults allow 5 files per reply and 30 MiB per file.
 
 `agentPreset` is optional and defaults to the Harness preset roster's current default. A newly created session records the resolved preset in its header. Persistent resumes restore the preset recorded by the session (including later `agent-preset/selected` events); only a legacy session with no recorded preset uses the current configured/default fallback. If Web already has the same session loaded, the channel reuses that live Agent rather than creating a second writer.
 
@@ -156,7 +171,7 @@ After the log reports that the iLink credential is verified, send `/bot-ping` fr
 pong — DeepSeek Harness 微信机器人已连接。
 ```
 
-Send `/bot-image-test` to verify encrypted CDN upload and image delivery without depending on model-generated media. Then send ordinary text and a photo to verify the Harness model route.
+Send `/bot-image-test` and `/bot-file-test` to verify encrypted CDN image and file delivery without depending on model-generated media. Then send ordinary text, a photo, and a small document. Ask the bot to inspect the document, then ask it to create and return a file; the reply should include a native file attachment.
 
 To verify tool approval, send “我当前有啥文件？”. After receiving `Bash 请求执行：...`, reply with the exact `/approve <code>` shown. The plugin should acknowledge the decision and then send only the final file listing after tool execution. `/reject <code>` denies that one call.
 
@@ -170,6 +185,8 @@ Run `dsh plugin --profile web exec dsh-weixin login --wait` to force a fresh sca
 pnpm install
 pnpm run check
 ```
+
+The repository pins pnpm `10.33.4`; pnpm 11 is not required.
 
 Built `dist/` artifacts are committed so GitHub installs do not require executing a dependency build script.
 

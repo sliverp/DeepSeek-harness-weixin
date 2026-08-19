@@ -25,9 +25,11 @@ export type { ApprovalCommand, ResolvedApproval } from './approvals.js'
 export { WeixinHarnessBridge }
 export type { WeixinLoginRequest }
 export type { ConversationCommandOutcome, ConversationReply } from './conversations.js'
-export { detectImageMediaType, inboundContent } from './inbound.js'
+export { detectImageMediaType, inboundContent, safeFileName } from './inbound.js'
 export { loginWithQr } from './login.js'
 export { filterMarkdownForWeixin, StreamingMarkdownFilter } from './markdown-filter.js'
+export { collectOutboundFiles } from './outbound-files.js'
+export type { OutboundFile, OutboundFileCollection } from './outbound-files.js'
 export { WeixinApiClient } from './protocol.js'
 export {
   defaultControlSocketPath,

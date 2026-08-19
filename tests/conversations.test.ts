@@ -79,7 +79,7 @@ describe('ConversationManager', () => {
     await manager.initialize()
 
     await expect(manager.process(inbound('user-1', 'hi'), { downloadImage: vi.fn() } as never))
-      .resolves.toEqual({ text: 'hello weixin', images: [] })
+      .resolves.toEqual({ text: 'hello weixin', images: [], files: [] })
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       meta: { cwd: '/tmp/weixin-test', agentPreset: 'standard' },
@@ -135,7 +135,7 @@ describe('ConversationManager', () => {
     await manager.initialize()
 
     await expect(manager.process(message, { downloadImage: vi.fn() } as never))
-      .resolves.toEqual({ text: 'resumed reply', images: [] })
+      .resolves.toEqual({ text: 'resumed reply', images: [], files: [] })
 
     expect(inspect).toHaveBeenCalledWith(id)
     expect(resume).toHaveBeenCalledWith(expect.objectContaining({ setup: expect.any(Function) }))
@@ -180,7 +180,7 @@ describe('ConversationManager', () => {
     await manager.initialize()
 
     await expect(manager.process(message, { downloadImage: vi.fn() } as never))
-      .resolves.toEqual({ text: 'fallback reply', images: [] })
+      .resolves.toEqual({ text: 'fallback reply', images: [], files: [] })
     expect(mount).toHaveBeenCalledWith(expect.anything(), 'code')
     await manager.dispose()
   })
@@ -224,7 +224,7 @@ describe('ConversationManager', () => {
     await manager.initialize()
 
     await expect(manager.process(message, { downloadImage: vi.fn() } as never))
-      .resolves.toEqual({ text: 'weixin reply', images: [] })
+      .resolves.toEqual({ text: 'weixin reply', images: [], files: [] })
 
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
     expect(inspect).not.toHaveBeenCalled()
@@ -288,7 +288,7 @@ describe('ConversationManager', () => {
       toolName: 'bash',
     })
 
-    await expect(work).resolves.toEqual({ text: '审批后执行完成。', images: [] })
+    await expect(work).resolves.toEqual({ text: '审批后执行完成。', images: [], files: [] })
     expect(on).toHaveBeenCalledOnce()
     expect(stopApprovalAnswerer).toHaveBeenCalledOnce()
     await manager.dispose()

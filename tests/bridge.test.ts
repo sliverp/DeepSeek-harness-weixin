@@ -21,9 +21,11 @@ const REPLACEMENT_CREDENTIAL: WeixinCredential = {
 class FakeApi implements WeixinApiPort {
   readonly sentTexts: Array<{ to: string; text: string; context?: string }> = []
   readonly sentImages: Array<{ to: string; data: Uint8Array; context?: string }> = []
+  readonly sentFiles: Array<{ to: string; data: Uint8Array; name: string; context?: string }> = []
   readonly notifyStart = vi.fn(async () => undefined)
   readonly notifyStop = vi.fn(async () => undefined)
   readonly downloadImage = vi.fn(async () => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  readonly downloadFile = vi.fn(async () => Buffer.from('file'))
   private readonly updates: GetUpdatesResponse[]
 
   constructor(...updates: GetUpdatesResponse[]) {
@@ -47,6 +49,10 @@ class FakeApi implements WeixinApiPort {
 
   async sendImage(to: string, data: Uint8Array, context?: string): Promise<void> {
     this.sentImages.push({ to, data, ...(context === undefined ? {} : { context }) })
+  }
+
+  async sendFile(to: string, data: Uint8Array, name: string, context?: string): Promise<void> {
+    this.sentFiles.push({ to, data, name, ...(context === undefined ? {} : { context }) })
   }
 }
 
@@ -85,7 +91,7 @@ function agentContext(replyText = 'model reply', includeToolStep = false, stallR
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events },
+    session: { events, header: { cwd: '/tmp/weixin-test' } },
     ctx: { on: vi.fn(() => vi.fn()) },
     inject: vi.fn(),
     followup: vi.fn((userMessage: { id: string }) => {
@@ -472,6 +478,16 @@ describe('WeixinHarnessBridge', () => {
     await vi.waitFor(() => expect(api.sentImages).toHaveLength(1))
     expect(Buffer.from(api.sentImages[0]?.data ?? []).subarray(0, 8))
       .toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    await bridge.stop()
+  })
+
+  it('sends the built-in file diagnostic through the encrypted file API', async () => {
+    const api = new FakeApi({ ret: 0, msgs: [message('/bot-file-test', 32)] })
+    const bridge = new WeixinHarnessBridge(commandContext(JSON.stringify(CREDENTIAL)), testConfig(), () => api)
+    await bridge.start()
+    await vi.waitFor(() => expect(api.sentFiles).toHaveLength(1))
+    expect(api.sentFiles[0]).toMatchObject({ name: 'weixin-file-test.txt', context: 'context-1' })
+    expect(Buffer.from(api.sentFiles[0]?.data ?? []).toString()).toContain('file delivery is working')
     await bridge.stop()
   })
 

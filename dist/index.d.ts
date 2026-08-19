@@ -21,6 +21,9 @@ interface Config {
     accessPolicy: AccessMode;
     allowFrom: string[];
     imageInputMode: ImageInputMode;
+    maxInboundFiles: number;
+    maxInboundFileBytes: number;
+    maxInboundMessageFileBytes: number;
     responseTimeoutMs: number;
     approvalTimeoutMs: number;
     mediaDownloadTimeoutMs: number;
@@ -36,6 +39,8 @@ interface Config {
     maxReplyBytes: number;
     maxReplyImages: number;
     maxOutboundImageBytes: number;
+    maxReplyFiles: number;
+    maxOutboundFileBytes: number;
     maxSeenMessageIds: number;
     systemPrompt: string;
 }
@@ -61,6 +66,13 @@ interface ImageItem {
     thumb_width?: number;
     hd_size?: number;
 }
+/** One encrypted generic file item. */
+interface FileItem {
+    media?: CdnMedia;
+    file_name?: string;
+    md5?: string;
+    len?: string;
+}
 /** One structured message item. */
 interface MessageItem {
     type?: number;
@@ -80,12 +92,7 @@ interface MessageItem {
         media?: CdnMedia;
         text?: string;
     };
-    file_item?: {
-        media?: CdnMedia;
-        file_name?: string;
-        md5?: string;
-        len?: string;
-    };
+    file_item?: FileItem;
     video_item?: {
         media?: CdnMedia;
         video_size?: number;
@@ -152,7 +159,9 @@ interface WeixinApiPort {
     notifyStop(): Promise<void>;
     sendText(to: string, text: string, contextToken?: string): Promise<void>;
     sendImage(to: string, data: Uint8Array, contextToken?: string): Promise<void>;
+    sendFile(to: string, data: Uint8Array, name: string, contextToken?: string): Promise<void>;
     downloadImage(image: ImageItem, timeoutMs: number): Promise<Buffer>;
+    downloadFile(file: FileItem, timeoutMs: number): Promise<Buffer>;
 }
 /** Official iLink JSON/CDN client derived from Tencent/openclaw-weixin 2.4.6. */
 declare class WeixinApiClient implements WeixinApiPort {
@@ -161,13 +170,16 @@ declare class WeixinApiClient implements WeixinApiPort {
     private readonly config;
     private readonly fetchImpl;
     private readonly cdnBaseUrl;
-    constructor(baseUrl: string, token: string, config: Pick<Config, 'apiTimeoutMs' | 'sendRetries' | 'maxOutboundImageBytes'>, fetchImpl?: FetchPort);
+    constructor(baseUrl: string, token: string, config: Pick<Config, 'apiTimeoutMs' | 'sendRetries' | 'maxOutboundImageBytes' | 'maxOutboundFileBytes'>, fetchImpl?: FetchPort);
     getUpdates(cursor: string, timeoutMs: number, signal?: AbortSignal): Promise<GetUpdatesResponse>;
     notifyStart(): Promise<void>;
     notifyStop(): Promise<void>;
     sendText(to: string, text: string, contextToken?: string): Promise<void>;
     sendImage(to: string, data: Uint8Array, contextToken?: string): Promise<void>;
+    sendFile(to: string, data: Uint8Array, name: string, contextToken?: string): Promise<void>;
     downloadImage(image: ImageItem, timeoutMs: number): Promise<Buffer>;
+    downloadFile(file: FileItem, timeoutMs: number): Promise<Buffer>;
+    private uploadMedia;
     private sendItem;
     private uploadEncrypted;
     private postJson;
@@ -263,6 +275,19 @@ declare class WeixinApprovalRegistry {
 /** Render the exact structured tool call linked by the approval request when available. */
 declare function formatApprovalPrompt(request: ApprovalRequest, code: string, timeoutMs: number): string;
 
+/** One workspace file materialized for a Weixin upload. */
+interface OutboundFile {
+    data: Uint8Array;
+    name: string;
+}
+/** Files and user-visible safety warnings extracted from one final answer. */
+interface OutboundFileCollection {
+    files: OutboundFile[];
+    warnings: string[];
+}
+/** Resolve final-answer file links into bounded bytes that can be uploaded by Weixin. */
+declare function collectOutboundFiles(text: string, cwd: string, maxFiles: number, maxFileBytes: number): Promise<OutboundFileCollection>;
+
 /** Completed response from one Weixin-triggered Harness turn. */
 interface ConversationReply {
     text: string;
@@ -271,6 +296,7 @@ interface ConversationReply {
         mediaType: string;
         name?: string;
     }>;
+    files: OutboundFile[];
 }
 /** Result of dispatching one syntactically valid Harness slash command. */
 type ConversationCommandOutcome = {
@@ -282,7 +308,9 @@ type ConversationCommandOutcome = {
 };
 
 /** Build durable DSH content blocks from one official Weixin message. */
-declare function inboundContent(ctx: Context, config: Config, api: WeixinApiPort, message: WeixinMessage, includeImages?: boolean): Promise<ContentBlock[]>;
+declare function inboundContent(ctx: Context, config: Config, api: WeixinApiPort, message: WeixinMessage, includeImages?: boolean, workspaceCwd?: string): Promise<ContentBlock[]>;
+/** Reduce an untrusted Weixin filename to one portable leaf while preserving a useful extension. */
+declare function safeFileName(value: string | undefined, index?: number): string;
 /** Detect image formats accepted by Harness attachments from magic bytes. */
 declare function detectImageMediaType(data: Uint8Array): ImageMediaType;
 
@@ -447,4 +475,4 @@ declare const _default: {
     apply: typeof apply;
 };
 
-export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type ResolvedApproval, SeenMessageIds, type StandaloneLoginOptions, type StandaloneQrLogin, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlRequestOptions, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginStandalone, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, sessionIdFor, truncateUtf8, waitForLoginFromControlSocket };
+export { type ApprovalCommand, Config, Config as ConfigType, type ConversationCommandOutcome, type ConversationReply, type OutboundFile, type OutboundFileCollection, type ResolvedApproval, SeenMessageIds, type StandaloneLoginOptions, type StandaloneQrLogin, StreamingMarkdownFilter, WeixinApiClient, WeixinApprovalRegistry, type WeixinControlRequestOptions, type WeixinControlResponse, WeixinControlServer, WeixinHarnessBridge, type WeixinLoginRequest, apply, collectOutboundFiles, _default as default, defaultControlSocketPath, detectImageMediaType, filterMarkdownForWeixin, formatApprovalPrompt, inboundContent, inject, loginStandalone, loginWithQr, mountBridge, name, parseApprovalCommand, parseCredential, requestLoginFromControlSocket, resolveControlSocketPath, safeFileName, sessionIdFor, truncateUtf8, waitForLoginFromControlSocket };

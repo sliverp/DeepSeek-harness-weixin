@@ -44,6 +44,14 @@ export interface ImageItem {
   hd_size?: number
 }
 
+/** One encrypted generic file item. */
+export interface FileItem {
+  media?: CdnMedia
+  file_name?: string
+  md5?: string
+  len?: string
+}
+
 /** One structured message item. */
 export interface MessageItem {
   type?: number
@@ -55,7 +63,7 @@ export interface MessageItem {
   text_item?: { text?: string }
   image_item?: ImageItem
   voice_item?: { media?: CdnMedia; text?: string }
-  file_item?: { media?: CdnMedia; file_name?: string; md5?: string; len?: string }
+  file_item?: FileItem
   video_item?: { media?: CdnMedia; video_size?: number; thumb_media?: CdnMedia }
 }
 

@@ -14,6 +14,7 @@ import {
 } from './approvals.js'
 import type { Config } from './config.js'
 import { inboundContent } from './inbound.js'
+import { collectOutboundFiles, type OutboundFile } from './outbound-files.js'
 import type { WeixinApiPort } from './protocol.js'
 import type { WeixinMessage } from './types.js'
 import { sessionIdFor, withTimeout } from './util.js'
@@ -22,6 +23,7 @@ import { sessionIdFor, withTimeout } from './util.js'
 export interface ConversationReply {
   text: string
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
+  files: OutboundFile[]
 }
 
 /** Result of dispatching one syntactically valid Harness slash command. */
@@ -151,7 +153,14 @@ export class ConversationManager {
   ): Promise<ConversationReply> {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
-    const content = await inboundContent(this.ctx, this.config, api, message, await this.includeImages(agent))
+    const content = await inboundContent(
+      this.ctx,
+      this.config,
+      api,
+      message,
+      await this.includeImages(agent),
+      agent.session.header?.cwd ?? this.config.cwd,
+    )
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     const userMessage = createUserMessage({ content, source: { kind: 'user' } })
@@ -227,10 +236,11 @@ export class ConversationManager {
       return {
         kind: 'handled',
         reply: generated === undefined
-          ? { text: resultText, images: [] }
+          ? { text: resultText, images: [], files: [] }
           : {
               text: [resultText, generated.text].filter(Boolean).join('\n\n'),
               images: generated.images,
+              files: generated.files,
             },
       }
     } finally {
@@ -429,12 +439,23 @@ export class ConversationManager {
       }
     }
     if (texts.length === 0 && finalTurn?.type === 'turn/end' && finalTurn.data.reason.kind === 'error') {
-      return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images }
+      return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images, files: [] }
     }
     if (texts.length === 0 && images.length === 0) {
-      return { text: '处理完成，但没有生成可发送的内容。', images }
+      return { text: '处理完成，但没有生成可发送的内容。', images, files: [] }
     }
-    return { text: texts.join('\n\n'), images }
+    const text = texts.join('\n\n')
+    const collected = await collectOutboundFiles(
+      text,
+      agent.session.header?.cwd ?? this.config.cwd,
+      this.config.maxReplyFiles,
+      this.config.maxOutboundFileBytes,
+    )
+    return {
+      text: [text, ...collected.warnings.map(warning => `⚠️ ${warning}`)].filter(Boolean).join('\n\n'),
+      images,
+      files: collected.files,
+    }
   }
 
   private async collectLatestReply(
@@ -462,10 +483,20 @@ export class ConversationManager {
       }
     }
     if (texts.length === 0 && images.length === 0 && finalTurn.data.reason.kind === 'error') {
-      return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images }
+      return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images, files: [] }
     }
-    return texts.length === 0 && images.length === 0
-      ? undefined
-      : { text: texts.join('\n\n'), images }
+    if (texts.length === 0 && images.length === 0) return undefined
+    const text = texts.join('\n\n')
+    const collected = await collectOutboundFiles(
+      text,
+      agent.session.header?.cwd ?? this.config.cwd,
+      this.config.maxReplyFiles,
+      this.config.maxOutboundFileBytes,
+    )
+    return {
+      text: [text, ...collected.warnings.map(warning => `⚠️ ${warning}`)].filter(Boolean).join('\n\n'),
+      images,
+      files: collected.files,
+    }
   }
 }

@@ -1,7 +1,16 @@
-import { describe, expect, it, vi } from 'vitest'
-import { detectImageMediaType, inboundContent } from '../src/inbound.js'
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { detectImageMediaType, inboundContent, safeFileName } from '../src/inbound.js'
 import { MessageItemType, type WeixinMessage } from '../src/types.js'
 import { testConfig } from './fixtures.js'
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+})
 
 function context(): never {
   return {
@@ -44,6 +53,31 @@ describe('inboundContent', () => {
     const api = { downloadImage: vi.fn(async () => Buffer.alloc(101)) }
     await expect(inboundContent(context(), testConfig(), api as never, imageMessage()))
       .rejects.toThrow('attachment limit')
+  })
+
+  it('downloads and stores an encrypted file inside the Agent workspace', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'dsh-weixin-inbound-'))
+    temporaryDirectories.push(cwd)
+    const api = { downloadFile: vi.fn(async () => Buffer.from('file contents')) }
+    const message: WeixinMessage = {
+      from_user_id: 'user-123456789',
+      item_list: [{
+        type: MessageItemType.FILE,
+        file_item: { file_name: '../report.txt', media: { encrypt_query_param: 'encrypted' } },
+      }],
+    }
+    const blocks = await inboundContent(context(), testConfig({ cwd }), api as never, message, true, cwd)
+    const text = blocks[0]?.type === 'text' ? blocks[0].text : ''
+    const absolutePath = /Absolute path: ([^\n]+?)\. Use filesystem/u.exec(text)?.[1]
+    if (absolutePath === undefined) throw new Error('stored file path was not rendered')
+    expect(absolutePath.startsWith(await realpath(cwd))).toBe(true)
+    expect(await readFile(absolutePath, 'utf8')).toBe('file contents')
+    expect(text).toContain('report.txt')
+  })
+
+  it('sanitizes untrusted file names to portable leaves', () => {
+    expect(safeFileName('../folder\\bad:name?.txt')).toBe('bad_name_.txt')
+    expect(safeFileName('..', 2)).toBe('weixin-file-3')
   })
 
   it('recognizes all accepted image magic values', () => {

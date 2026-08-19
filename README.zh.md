@@ -13,17 +13,23 @@
 - 长轮询游标原子持久化，重启后继续消费。
 - 每个微信用户对应一个持久 Harness 会话。
 - 完整接入 Harness Agent preset 生命周期、结构化工具执行和 Web live session 复用。
-- 接收文字、语音转写、引用上下文和 AES 加密图片。
-- 发送文字，并通过微信 CDN 加密上传图片。
+- 接收文字、语音转写、引用上下文、AES 加密图片和普通文件。
+- 发送文字，并通过微信 CDN 加密上传图片和普通文件。
 - 出站文字支持与腾讯插件一致的部分 Markdown 渲染。
 - 当前模型不支持视觉时，自动保存图片并降级为附件说明。
 - 支持允许名单、禁用策略、有界并发、去重、重试和完整清理。
-- 内置 `/bot-ping`、`/bot-help`、`/bot-status`、`/bot-image-test`、`/bot-cancel`。
+- 内置 `/bot-ping`、`/bot-help`、`/bot-status`、`/bot-image-test`、`/bot-file-test`、`/bot-cancel`。
 - 按需扫码不阻塞 Harness Web；Linux 登录命令可在 Web 启动前独立完成授权。
 - 工具请求审批时，可在同一微信会话用 `/approve <短码>` 或 `/reject <短码>` 决定。
 - `/new`、`/reset` 创建新的持久 session；其他 Harness 斜杠命令直接进入命令运行时。
 
 腾讯当前的 ClawBot/iLink 接入仅支持私聊。
+
+## 环境要求
+
+- Node.js 22.19 或更高版本
+- pnpm 10.33.4
+- DeepSeek Harness 0.1.0-rc.7 或更高版本
 
 ## 前置条件：ClawBot 权限
 
@@ -108,6 +114,11 @@ dsh plugin --profile web exec dsh-weixin login --url --wait
     approvalTimeoutMs: 240000
     maxInFlightMessages: 8
     maxReplyImages: 4
+    maxInboundFiles: 10
+    maxInboundFileBytes: 31457280
+    maxInboundMessageFileBytes: 104857600
+    maxReplyFiles: 5
+    maxOutboundFileBytes: 31457280
 ```
 
 `statePath` 为空时，游标默认保存在 `~/.dsh/weixin/`，并以原子写入和 `0600` 文件权限保护。
@@ -117,6 +128,10 @@ dsh plugin --profile web exec dsh-weixin login --url --wait
 `autoLogin` 默认为 `false`：缺少凭据时保持离线，只有运行上面的 Linux 命令才发起扫码。设为 `true` 可恢复启动 Web 时在后台自动显示二维码的行为；无论取值如何，扫码都不会阻塞 Web。
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
+
+收到 iLink `FILE` 消息项后，插件会在模型回合开始前下载并完成 AES 解密。文件名会收敛为安全叶子名，每条消息使用 `<cwd>/.dsh-weixin/inbox/` 下独立的私有目录；模型只收到相对路径和绝对路径，并通过正常文件工具读取，插件不会执行文件，也不会把内容悄悄复制进提示词。默认最多接收 10 个文件、单文件 30 MiB、单条消息合计 100 MiB。
+
+模型需要主动回传工作区文件时，应在最终可见回复中提供明确的 Markdown 文件链接。插件会解析真实路径，拒绝不存在的文件、目录、符号链接逃逸、空文件以及 session `cwd` 之外的目标，再使用官方 `media_type=FILE` 加密上传和 `FILE` 消息项发送。默认每次回复最多 5 个文件、单文件 30 MiB。
 
 `agentPreset` 可省略，默认采用 Harness preset roster 当前的默认项。新 session 会把最终解析出的 preset 记录到 header；恢复持久 session 时会采用该 session 记录的 preset（包括后续的 `agent-preset/selected` 事件）。只有完全没有 preset 记录的旧 session 才会明确回退到当前配置或默认 preset。同一 session 已经被 Web 加载时，微信通道会复用该 live Agent，不会启动第二个 writer。
 
@@ -156,7 +171,7 @@ iLink 协议的出站文字只是普通 `text_item.text` 字符串，不存在�
 pong — DeepSeek Harness 微信机器人已连接。
 ```
 
-发送 `/bot-image-test` 可以独立验证 AES 加密、微信 CDN 上传和图片投递，不依赖模型生成图片。然后再发送普通文字和一张照片，验证 Harness 模型链路。
+发送 `/bot-image-test` 和 `/bot-file-test` 可以独立验证 AES 加密、微信 CDN 图片和文件投递，不依赖模型生成媒体。然后发送普通文字、照片和一个小文档，让机器人读取文档；再要求它创建并回传文件，回复中应收到原生文件附件。
 
 工具审批可发送“我当前有啥文件？”验证。收到 `Bash 请求执行：...` 后，原样回复其中的 `/approve <短码>`；插件应先确认批准，随后只发送工具执行后的最终文件列表。回复 `/reject <短码>` 则拒绝该次调用。
 
@@ -170,6 +185,8 @@ pong — DeepSeek Harness 微信机器人已连接。
 pnpm install
 pnpm run check
 ```
+
+仓库固定使用 pnpm `10.33.4`，不要求 pnpm 11。
 
 仓库提交构建后的 `dist/`，因此从 GitHub 安装时不需要授权依赖执行构建脚本。
 

@@ -7,14 +7,15 @@ import {
   UploadMediaType,
   type BaseInfo,
   type GetUpdatesResponse,
+  type FileItem,
   type ImageItem,
   type MessageItem,
   type WeixinMessage,
 } from './types.js'
 import { generateClientId } from './util.js'
 
-const CHANNEL_VERSION = '0.2.4'
-const BOT_AGENT = 'DeepSeek-Harness/0.2.4'
+const CHANNEL_VERSION = '0.2.5'
+const BOT_AGENT = 'DeepSeek-Harness/0.2.5'
 const ILINK_APP_ID = 'bot'
 // Protocol compatibility level of Tencent/openclaw-weixin v2.4.6.
 const ILINK_APP_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6
@@ -29,7 +30,9 @@ export interface WeixinApiPort {
   notifyStop(): Promise<void>
   sendText(to: string, text: string, contextToken?: string): Promise<void>
   sendImage(to: string, data: Uint8Array, contextToken?: string): Promise<void>
+  sendFile(to: string, data: Uint8Array, name: string, contextToken?: string): Promise<void>
   downloadImage(image: ImageItem, timeoutMs: number): Promise<Buffer>
+  downloadFile(file: FileItem, timeoutMs: number): Promise<Buffer>
 }
 
 /** Official iLink JSON/CDN client derived from Tencent/openclaw-weixin 2.4.6. */
@@ -39,7 +42,10 @@ export class WeixinApiClient implements WeixinApiPort {
   constructor(
     private readonly baseUrl: string,
     private readonly token: string,
-    private readonly config: Pick<Config, 'apiTimeoutMs' | 'sendRetries' | 'maxOutboundImageBytes'>,
+    private readonly config: Pick<
+      Config,
+      'apiTimeoutMs' | 'sendRetries' | 'maxOutboundImageBytes' | 'maxOutboundFileBytes'
+    >,
     private readonly fetchImpl: FetchPort = fetch,
   ) {}
 
@@ -85,38 +91,37 @@ export class WeixinApiClient implements WeixinApiPort {
     if (plaintext.byteLength > this.config.maxOutboundImageBytes) {
       throw new Error(`Weixin outbound image exceeds the ${this.config.maxOutboundImageBytes}-byte limit`)
     }
-    const key = randomBytes(16)
-    const filekey = randomBytes(16).toString('hex')
-    const encrypted = encryptAesEcb(plaintext, key)
-    const upload = await this.postJson('ilink/bot/getuploadurl', {
-      filekey,
-      media_type: UploadMediaType.IMAGE,
-      to_user_id: to,
-      rawsize: plaintext.byteLength,
-      rawfilemd5: createHash('md5').update(plaintext).digest('hex'),
-      filesize: encrypted.byteLength,
-      no_need_thumb: true,
-      aeskey: key.toString('hex'),
-      base_info: baseInfo(),
-    }, this.config.apiTimeoutMs, 'getUploadUrl') as {
-      upload_param?: string
-      upload_full_url?: string
-    }
-    const uploadUrl = upload.upload_full_url?.trim()
-      || (upload.upload_param
-        ? `${this.cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param)}&filekey=${encodeURIComponent(filekey)}`
-        : '')
-    if (!uploadUrl) throw new Error('getUploadUrl returned no CDN upload URL')
-    const downloadParam = await this.uploadEncrypted(uploadUrl, encrypted)
+    const uploaded = await this.uploadMedia(to, plaintext, UploadMediaType.IMAGE)
     await this.sendItem(to, {
       type: MessageItemType.IMAGE,
       image_item: {
         media: {
-          encrypt_query_param: downloadParam,
-          aes_key: Buffer.from(key.toString('hex')).toString('base64'),
+          encrypt_query_param: uploaded.downloadParam,
+          aes_key: Buffer.from(uploaded.key.toString('hex')).toString('base64'),
           encrypt_type: 1,
         },
-        mid_size: encrypted.byteLength,
+        mid_size: uploaded.encryptedBytes,
+      },
+    }, contextToken)
+  }
+
+  async sendFile(to: string, data: Uint8Array, name: string, contextToken?: string): Promise<void> {
+    const plaintext = Buffer.from(data)
+    if (plaintext.byteLength === 0) throw new Error('Weixin does not allow empty outbound files')
+    if (plaintext.byteLength > this.config.maxOutboundFileBytes) {
+      throw new Error(`Weixin outbound file exceeds the ${this.config.maxOutboundFileBytes}-byte limit`)
+    }
+    const uploaded = await this.uploadMedia(to, plaintext, UploadMediaType.FILE)
+    await this.sendItem(to, {
+      type: MessageItemType.FILE,
+      file_item: {
+        media: {
+          encrypt_query_param: uploaded.downloadParam,
+          aes_key: Buffer.from(uploaded.key.toString('hex')).toString('base64'),
+          encrypt_type: 1,
+        },
+        file_name: name,
+        len: String(plaintext.byteLength),
       },
     }, contextToken)
   }
@@ -139,6 +144,56 @@ export class WeixinApiClient implements WeixinApiPort {
         ? parseBase64Key(media.aes_key)
         : undefined
     return key === undefined ? bytes : decryptAesEcb(bytes, key)
+  }
+
+  async downloadFile(file: FileItem, timeoutMs: number): Promise<Buffer> {
+    const media = file.media
+    if (media === undefined) throw new Error('Weixin file has no CDN media reference')
+    const encryptedQuery = media.encrypt_query_param ?? ''
+    const url = media.full_url?.trim()
+      || (encryptedQuery
+        ? `${this.cdnBaseUrl}/download?encrypted_query_param=${encodeURIComponent(encryptedQuery)}`
+        : '')
+    if (!url) throw new Error('Weixin file has no CDN download URL')
+    const response = await fetchWithTimeout(this.fetchImpl, url, { method: 'GET' }, timeoutMs)
+    if (!response.ok) throw new Error(`Weixin CDN download failed with HTTP ${response.status}`)
+    const bytes = Buffer.from(await response.arrayBuffer())
+    const key = media.aes_key?.trim() ? parseBase64Key(media.aes_key) : undefined
+    return key === undefined ? bytes : decryptAesEcb(bytes, key)
+  }
+
+  private async uploadMedia(
+    to: string,
+    plaintext: Buffer,
+    mediaType: (typeof UploadMediaType)[keyof typeof UploadMediaType],
+  ): Promise<{ downloadParam: string; encryptedBytes: number; key: Buffer }> {
+    const key = randomBytes(16)
+    const filekey = randomBytes(16).toString('hex')
+    const encrypted = encryptAesEcb(plaintext, key)
+    const upload = await this.postJson('ilink/bot/getuploadurl', {
+      filekey,
+      media_type: mediaType,
+      to_user_id: to,
+      rawsize: plaintext.byteLength,
+      rawfilemd5: createHash('md5').update(plaintext).digest('hex'),
+      filesize: encrypted.byteLength,
+      no_need_thumb: true,
+      aeskey: key.toString('hex'),
+      base_info: baseInfo(),
+    }, this.config.apiTimeoutMs, 'getUploadUrl') as {
+      upload_param?: string
+      upload_full_url?: string
+    }
+    const uploadUrl = upload.upload_full_url?.trim()
+      || (upload.upload_param
+        ? `${this.cdnBaseUrl}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param)}&filekey=${encodeURIComponent(filekey)}`
+        : '')
+    if (!uploadUrl) throw new Error('getUploadUrl returned no CDN upload URL')
+    return {
+      downloadParam: await this.uploadEncrypted(uploadUrl, encrypted),
+      encryptedBytes: encrypted.byteLength,
+      key,
+    }
   }
 
   private async sendItem(to: string, item: MessageItem, contextToken?: string): Promise<void> {

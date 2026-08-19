@@ -163,7 +163,7 @@ describe('ConversationManager real Agent Loop', () => {
       await expect(manager.executeCommand(message, '/probe exact', { downloadImage: vi.fn() } as never))
         .resolves.toEqual({
           kind: 'handled',
-          reply: { text: 'probe: exact', images: [] },
+          reply: { text: 'probe: exact', images: [], files: [] },
         })
 
       const agent = ctx.agents.get(SessionId(sessionIdFor('account-1', message)))
@@ -226,7 +226,7 @@ describe('ConversationManager real Agent Loop', () => {
     try {
       await first.initialize()
       await expect(first.process(message, { downloadImage: vi.fn() } as never))
-        .resolves.toEqual({ text: '旧会话回复', images: [] })
+        .resolves.toEqual({ text: '旧会话回复', images: [], files: [] })
       const oldAgent = ctx.agents.get(baseId)
       if (oldAgent === undefined) throw new Error('expected the original Agent before /new')
       const oldEvents = structuredClone([...oldAgent.session.events])
@@ -238,7 +238,7 @@ describe('ConversationManager real Agent Loop', () => {
       expect(adapter.requests).toHaveLength(1)
 
       await expect(first.process(message, { downloadImage: vi.fn() } as never))
-        .resolves.toEqual({ text: '新会话回复', images: [] })
+        .resolves.toEqual({ text: '新会话回复', images: [], files: [] })
       const rotated = ctx.agents.get(rotatedId)
       if (rotated === undefined) throw new Error('expected the rotated Agent')
       expect(rotated.session.header.agentPreset).toBe('standard')
@@ -252,7 +252,7 @@ describe('ConversationManager real Agent Loop', () => {
       resumed = new ConversationManager(ctx, testConfig(), 'account-1')
       await resumed.initialize()
       await expect(resumed.process(message, { downloadImage: vi.fn() } as never))
-        .resolves.toEqual({ text: '重启后继续新会话', images: [] })
+        .resolves.toEqual({ text: '重启后继续新会话', images: [], files: [] })
       expect(ctx.agents.get(rotatedId)).toBeDefined()
       expect(ctx.agents.get(baseId)).toBeUndefined()
       expect(adapter.requests).toHaveLength(3)
@@ -283,7 +283,7 @@ describe('ConversationManager real Agent Loop', () => {
       if (agent === undefined) throw new Error('expected a live integration-test Agent')
       const events = agent.session.events
 
-      expect(reply).toEqual({ text: '当前文件：README.md', images: [] })
+      expect(reply).toEqual({ text: '当前文件：README.md', images: [], files: [] })
       expect(executionCount()).toBe(1)
       expect(adapter.requests).toHaveLength(2)
       expect(adapter.requests[0]?.tools?.map(tool => tool.name)).toContain('list_files')
@@ -344,7 +344,7 @@ describe('ConversationManager real Agent Loop', () => {
     try {
       await first.initialize()
       await expect(first.process(message, { downloadImage: vi.fn() } as never))
-        .resolves.toEqual({ text: '首次工具回复', images: [] })
+        .resolves.toEqual({ text: '首次工具回复', images: [], files: [] })
       const original = ctx.agents.get(id)
       if (original === undefined) throw new Error('expected the original live Agent')
       stored = {
@@ -357,7 +357,7 @@ describe('ConversationManager real Agent Loop', () => {
       resumed = new ConversationManager(ctx, testConfig({ agentPreset: 'code' }), 'account-1')
       await resumed.initialize()
       await expect(resumed.process(message, { downloadImage: vi.fn() } as never))
-        .resolves.toEqual({ text: '恢复后工具回复', images: [] })
+        .resolves.toEqual({ text: '恢复后工具回复', images: [], files: [] })
 
       const restored = ctx.agents.get(id)
       if (restored === undefined) throw new Error('expected the resumed live Agent')
@@ -407,7 +407,7 @@ describe('ConversationManager real Agent Loop', () => {
         outcome: 'allowed-once',
         toolName: 'bash',
       })
-      await expect(work).resolves.toEqual({ text: '审批后文件：README.md', images: [] })
+      await expect(work).resolves.toEqual({ text: '审批后文件：README.md', images: [], files: [] })
 
       const agent = ctx.agents.get(SessionId(sessionIdFor('account-1', message)))
       if (agent === undefined) throw new Error('expected a live approval integration-test Agent')

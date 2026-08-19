@@ -387,6 +387,7 @@ export class WeixinHarnessBridge {
       await this.sendReply(message, api, {
         text: '审批命令格式不正确。请回复 /approve 123456 或 /reject 123456。',
         images: [],
+        files: [],
       })
       return
     }
@@ -397,7 +398,7 @@ export class WeixinHarnessBridge {
         : resolved.outcome === 'allowed-once'
           ? `已批准 ${resolved.toolName}（${resolved.code}），正在继续执行。`
           : `已拒绝 ${resolved.toolName}（${resolved.code}）。`
-      await this.sendReply(message, api, { text, images: [] })
+      await this.sendReply(message, api, { text, images: [], files: [] })
       return
     }
     if (command === '/new' || command === '/reset') {
@@ -406,15 +407,16 @@ export class WeixinHarnessBridge {
         await this.sendReply(message, api, {
           text: '已开始新的 Harness 会话；旧 session 已保留，可继续在 Web 中查看。',
           images: [],
+          files: [],
         })
       } catch (error) {
         this.log.error('Weixin new-session command failed: %s', String(error))
-        await this.sendReply(message, api, { text: '创建新的 Harness 会话失败，请稍后重试。', images: [] })
+        await this.sendReply(message, api, { text: '创建新的 Harness 会话失败，请稍后重试。', images: [], files: [] })
       }
       return
     }
     if (command === '/bot-ping') {
-      await this.sendReply(message, api, { text: 'pong — DeepSeek Harness 微信机器人已连接。', images: [] })
+      await this.sendReply(message, api, { text: 'pong — DeepSeek Harness 微信机器人已连接。', images: [], files: [] })
       return
     }
     if (command === '/bot-help') {
@@ -423,6 +425,7 @@ export class WeixinHarnessBridge {
           'DeepSeek Harness 微信机器人',
           '/bot-ping — 检查连通性',
           '/bot-image-test — 发送蓝色图片，检查图片链路',
+          '/bot-file-test — 发送文本文件，检查文件链路',
           '/bot-status — 查看当前连接状态',
           '/bot-cancel — 取消当前生成',
           '/new 或 /reset — 保留旧 session 并开始新会话',
@@ -432,6 +435,7 @@ export class WeixinHarnessBridge {
           '其他消息会交给当前 Harness 默认模型处理。',
         ].join('\n'),
         images: [],
+        files: [],
       })
       return
     }
@@ -439,6 +443,15 @@ export class WeixinHarnessBridge {
       await this.sendReply(message, api, {
         text: '蓝色测试图片发送成功。',
         images: [{ data: OUTBOUND_TEST_PNG, mediaType: 'image/png', name: 'weixin-image-test.png' }],
+        files: [],
+      })
+      return
+    }
+    if (command === '/bot-file-test') {
+      await this.sendReply(message, api, {
+        text: '文件测试发送成功。',
+        images: [],
+        files: [{ data: Buffer.from('DeepSeek Harness Weixin file delivery is working.\n'), name: 'weixin-file-test.txt' }],
       })
       return
     }
@@ -446,6 +459,7 @@ export class WeixinHarnessBridge {
       await this.sendReply(message, api, {
         text: '微信 iLink 长轮询正常，DeepSeek Harness 会话按微信用户独立持久化。',
         images: [],
+        files: [],
       })
       return
     }
@@ -454,6 +468,7 @@ export class WeixinHarnessBridge {
       await this.sendReply(message, api, {
         text: cancelled ? '已请求取消当前生成。' : '当前没有正在生成的回复。',
         images: [],
+        files: [],
       })
       return
     }
@@ -474,11 +489,12 @@ export class WeixinHarnessBridge {
           await this.sendReply(message, api, {
             text: `未知命令 ${JSON.stringify(slashLine.split(/\s/u, 1)[0])}。可用命令：${available.join('、') || '无'}。`,
             images: [],
+            files: [],
           })
         }
       } catch (error) {
         this.log.error('Weixin Harness command failed: %s', String(error))
-        await this.sendReply(message, api, { text: '执行 Harness 命令时发生错误，请稍后重试。', images: [] })
+        await this.sendReply(message, api, { text: '执行 Harness 命令时发生错误，请稍后重试。', images: [], files: [] })
       }
       return
     }
@@ -486,6 +502,7 @@ export class WeixinHarnessBridge {
       await this.sendReply(message, api, {
         text: '斜杠命令格式不正确；命令名只能使用小写字母、数字、下划线或连字符。',
         images: [],
+        files: [],
       })
       return
     }
@@ -500,7 +517,7 @@ export class WeixinHarnessBridge {
     } catch (error) {
       this.log.error('Weixin message processing failed: %s', String(error))
       try {
-        await this.sendReply(message, api, { text: '处理消息时发生错误，请稍后重试。', images: [] })
+        await this.sendReply(message, api, { text: '处理消息时发生错误，请稍后重试。', images: [], files: [] })
       } catch (sendError) {
         this.log.error('Weixin error reply failed: %s', String(sendError))
       }
@@ -521,6 +538,9 @@ export class WeixinHarnessBridge {
     }
     for (const image of images) {
       await this.retry(() => api.sendImage(to, image.data, message.context_token))
+    }
+    for (const file of reply.files.slice(0, this.config.maxReplyFiles)) {
+      await this.retry(() => api.sendFile(to, file.data, file.name, message.context_token))
     }
   }
 
