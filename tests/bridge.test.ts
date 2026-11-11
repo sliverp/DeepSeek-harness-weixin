@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { WeixinHarnessBridge } from '../src/bridge.js'
 import type { WeixinApiPort } from '../src/protocol.js'
 import { MessageItemType, MessageType, type GetUpdatesResponse, type WeixinCredential } from '../src/types.js'
-import { testConfig } from './fixtures.js'
+import { fakeSession, testConfig } from './fixtures.js'
 
 const CREDENTIAL: WeixinCredential = {
   token: 'managed-token',
@@ -91,7 +91,7 @@ function agentContext(replyText = 'model reply', includeToolStep = false, stallR
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events, header: { cwd: '/tmp/weixin-test' } },
+    session: fakeSession(events, { cwd: '/tmp/weixin-test' }),
     ctx: { on: vi.fn(() => vi.fn()) },
     inject: vi.fn(),
     followup: vi.fn((userMessage: { id: string }) => {
@@ -144,8 +144,8 @@ function agentContext(replyText = 'model reply', includeToolStep = false, stallR
     agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
     agents: {
-      create: vi.fn(async (options: { sessionId?: string; setup?: (ctx: never) => Promise<void> }) => {
-        await options.setup?.({} as never)
+      create: vi.fn(async (options: { sessionId?: string; setup?: (ctx: never, agent: never) => Promise<void> }) => {
+        await options.setup?.({} as never, agent as never)
         registeredId = options.sessionId
         return {
           agent,

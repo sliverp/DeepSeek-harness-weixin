@@ -3,3 +3,5 @@ coverage/
 *.log
 .env
 .DS_Store
+.pnpm-store/
+.nvmrc
