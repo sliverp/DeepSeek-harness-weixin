@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ConversationManager } from '../src/conversations.js'
 import { MessageItemType, type WeixinMessage } from '../src/types.js'
 import { sessionIdFor } from '../src/util.js'
-import { testConfig } from './fixtures.js'
+import { fakeSession, fakeSessionHandle, testConfig } from './fixtures.js'
 
 function inbound(sender: string, text: string): WeixinMessage {
   return {
@@ -48,7 +48,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: fakeSession(events),
       ctx: approvalScope(),
       inject: vi.fn(),
       followup: vi.fn((userMessage: { id: string }) => appendTextTurn(events, userMessage, 'hello weixin')),
@@ -56,8 +56,8 @@ describe('ConversationManager', () => {
     }
     const dispose = vi.fn(async () => undefined)
     const mount = vi.fn(async () => ({ id: 'standard' }))
-    const create = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({ agent } as never)
+    const create = vi.fn(async (options: { setup?: (ctx: never, agent: never) => Promise<void> }) => {
+      await options.setup?.({} as never, agent as never)
       return { agent, dispose }
     })
     const setPermission = vi.fn()
@@ -102,7 +102,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: fakeSession(events),
       ctx: approvalScope(),
       inject: vi.fn(),
       followup: vi.fn((userMessage: { id: string }) => appendTextTurn(events, userMessage, 'resumed reply')),
@@ -110,21 +110,18 @@ describe('ConversationManager', () => {
     }
     const dispose = vi.fn(async () => undefined)
     const mount = vi.fn(async () => ({ id: 'minimal' }))
-    const resume = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({} as never)
+    const resume = vi.fn(async (options: { setup?: (ctx: never, agent: never) => Promise<void> }) => {
+      await options.setup?.({} as never, agent as never)
       return { agent, dispose }
     })
-    const inspect = vi.fn(async () => ({
-      meta: { version: 0, id, createdAt: 1, cwd: '/tmp/weixin-test', agentPreset: 'standard' },
-      events: [{
-        type: 'agent-preset/selected',
-        seq: 0,
-        time: 1,
-        data: { agentPreset: 'minimal' },
-      }],
-    }))
+    const open = vi.fn(async () => fakeSessionHandle(id, [{
+      type: 'agent-preset/selected',
+      seq: 0,
+      time: 1,
+      data: { agentPreset: 'minimal' },
+    }], { agentPreset: 'standard' }))
     const ctx = {
-      sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id } }]), open },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount },
       agents: { create: vi.fn(), resume, get: vi.fn() },
@@ -137,7 +134,7 @@ describe('ConversationManager', () => {
     await expect(manager.process(message, { downloadImage: vi.fn() } as never))
       .resolves.toEqual({ text: 'resumed reply', images: [], files: [] })
 
-    expect(inspect).toHaveBeenCalledWith(id)
+    expect(open).toHaveBeenCalledWith(id, 'read')
     expect(resume).toHaveBeenCalledWith(expect.objectContaining({ setup: expect.any(Function) }))
     expect(mount).toHaveBeenCalledWith(expect.anything(), 'minimal')
     expect(agent.inject).not.toHaveBeenCalled()
@@ -152,23 +149,20 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: fakeSession(events),
       ctx: approvalScope(),
       followup: vi.fn((userMessage: { id: string }) => appendTextTurn(events, userMessage, 'fallback reply')),
       whenIdle: vi.fn(async () => undefined),
     }
     const mount = vi.fn(async () => ({ id: 'code' }))
-    const resume = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({} as never)
+    const resume = vi.fn(async (options: { setup?: (ctx: never, agent: never) => Promise<void> }) => {
+      await options.setup?.({} as never, agent as never)
       return { agent, dispose: vi.fn(async () => undefined) }
     })
     const ctx = {
       sessionPersistence: {
-        list: vi.fn(async () => [{ id }]),
-        inspect: vi.fn(async () => ({
-          meta: { version: 0, id, createdAt: 1, cwd: '/tmp/weixin-test' },
-          events: [],
-        })),
+        list: vi.fn(async () => [{ header: { id } }]),
+        open: vi.fn(async () => fakeSessionHandle(id)),
       },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount },
@@ -194,7 +188,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: fakeSession(events),
       ctx: approvalScope(),
       followup: vi.fn((userMessage: { id: string }) => { submitted = userMessage }),
       whenIdle: vi.fn(async () => {
@@ -208,12 +202,12 @@ describe('ConversationManager', () => {
         appendTextTurn(events, { id: 'later-web-message' }, 'later Web reply', 9)
       }),
     }
-    const inspect = vi.fn()
+    const open = vi.fn()
     const resume = vi.fn()
     const create = vi.fn()
     const mount = vi.fn()
     const ctx = {
-      sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id } }]), open },
       agentDefaultModel: { currentSelection: vi.fn() },
       agentPresets: { defaultId: 'standard', mount },
       agents: { get: vi.fn(() => agent), resume, create },
@@ -227,7 +221,7 @@ describe('ConversationManager', () => {
       .resolves.toEqual({ text: 'weixin reply', images: [], files: [] })
 
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
-    expect(inspect).not.toHaveBeenCalled()
+    expect(open).not.toHaveBeenCalled()
     expect(resume).not.toHaveBeenCalled()
     expect(create).not.toHaveBeenCalled()
     expect(mount).not.toHaveBeenCalled()
@@ -249,7 +243,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: fakeSession(events),
       ctx: { on },
       followup: vi.fn((message: { id: string }) => { submitted = message }),
       whenIdle: vi.fn(async () => {
@@ -301,7 +295,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events: [] },
+      session: fakeSession(),
       ctx: approvalScope(),
       followup: vi.fn(),
       cancel,

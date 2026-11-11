@@ -36,3 +36,45 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     ...overrides,
   }
 }
+
+/** Minimal Session stand-in exposing the 0.2.x event-read surface. */
+export function fakeSession(
+  events: unknown[] = [],
+  header: Record<string, unknown> = {},
+): {
+  events: unknown[]
+  header: Record<string, unknown>
+  readonly seq: number
+  snapshotEvents(fromSeq?: number): readonly unknown[]
+} {
+  return {
+    events,
+    header: { version: 0, id: 'session-id', createdAt: 1, cwd: '/tmp/weixin-test', ...header },
+    get seq() {
+      return events.length
+    },
+    snapshotEvents(fromSeq = 0) {
+      return events.slice(fromSeq)
+    },
+  }
+}
+
+/** Minimal read-only SessionHandle stand-in returned by a persistence `open` mock. */
+export function fakeSessionHandle(
+  id: string,
+  events: unknown[] = [],
+  header: Record<string, unknown> = {},
+): {
+  readonly id?: string
+  readonly header: Record<string, unknown>
+  read(): Promise<{ events: readonly unknown[] }>
+  close(): Promise<void>
+} {
+  return {
+    header: { version: 0, id, createdAt: 1, cwd: '/tmp/weixin-test', ...header },
+    async read() {
+      return { events }
+    },
+    async close() {},
+  }
+}

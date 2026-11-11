@@ -29,7 +29,26 @@
 
 - Node.js 22.19 或更高版本
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.7 或更高版本
+- DeepSeek Harness 0.2.2-rc.1（桌面端 0.2.2-rc.1）
+
+这一版适配 0.2.x 插件 API：session preset 通过
+`@deepseek-ai/dsh-agent-preset-registry` 的 `agentPreset` projection 解析，
+不再 import 0.2.x 已移除的 `@deepseek-ai/dsh-agent-presets` 里的
+`resolveSessionPreset`。`@deepseek-ai/dsh-credentials-local` 运行时依赖及
+对应 Harness 包固定为 `0.2.2-rc.1`，与桌面端内置版本一致，不会遮蔽内置
+提供者；不需要再往 profile 里加 pnpm `overrides` 或 `shims` 兼容层。
+
+安装 profile 时 pnpm 可能提示 Harness 核心包缺少 peer 依赖，这是预期行为：
+桌面端运行时会提供这些包；把它们再提升一份到 profile 才会重新引入“遮蔽内置
+提供者”的故障。
+
+如果之前装过按 0.1.x 写的旧版本，先移除旧 profile 依赖再重装：
+
+```sh
+dsh plugin --profile web remove deepseek-harness-weixin
+rm -rf ~/.dsh/profiles/web/node_modules
+dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
+```
 
 ## 前置条件：ClawBot 权限
 
@@ -185,6 +204,8 @@ pong — DeepSeek Harness 微信机器人已连接。
 pnpm install
 pnpm run check
 ```
+
+CI 使用 Node `22.19.0`。
 
 仓库固定使用 pnpm `10.33.4`，不要求 pnpm 11。
 

@@ -1,11 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-permission-presets'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import {
   WeixinApprovalRegistry,
@@ -18,6 +18,15 @@ import { collectOutboundFiles, type OutboundFile } from './outbound-files.js'
 import type { WeixinApiPort } from './protocol.js'
 import type { WeixinMessage } from './types.js'
 import { sessionIdFor, withTimeout } from './util.js'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'deepseek-harness-weixin': {
+      kind: 'deepseek-harness-weixin'
+      form: 'instructions'
+    }
+  }
+}
 
 /** Completed response from one Weixin-triggered Harness turn. */
 export interface ConversationReply {
@@ -60,8 +69,8 @@ export class ConversationManager {
     if (this.config.permissionPreset !== undefined) {
       this.ctx.permissionPresets.resolve(this.config.permissionPreset)
     }
-    const headers = await this.ctx.sessionPersistence.list()
-    this.persistedIds = new Set(headers.map(header => String(header.id)))
+    const snapshots = await this.ctx.sessionPersistence.list()
+    this.persistedIds = new Set(snapshots.map(snapshot => String(snapshot.header.id)))
   }
 
   /** Process one inbound message after earlier work for the same Weixin user. */
@@ -162,7 +171,7 @@ export class ConversationManager {
       agent.session.header?.cwd ?? this.config.cwd,
     )
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const start = agent.session.seq
     const userMessage = createUserMessage({ content, source: { kind: 'user' } })
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
@@ -182,7 +191,7 @@ export class ConversationManager {
         agent.cancel({ kind: 'user' })
         throw error
       }
-      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id)
+      return this.collectReply(agent, agent.session.snapshotEvents(start), userMessage.id)
     } finally {
       stopApprovalAnswerer()
     }
@@ -202,7 +211,7 @@ export class ConversationManager {
     if (parsed === undefined) {
       return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
     }
-    const start = agent.session.events.length
+    const start = agent.session.seq
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
       if (!to) return Promise.reject(new Error('Weixin approval has no target user'))
@@ -218,7 +227,7 @@ export class ConversationManager {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
     }, this.config.responseTimeoutMs)
     try {
-      const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+      const execution = await this.ctx.commands.execute(agent, line, [], controller.signal)
       if (execution === undefined) {
         return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
       }
@@ -229,7 +238,7 @@ export class ConversationManager {
         agent.cancel({ kind: 'user' })
         throw error
       }
-      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start))
+      const generated = await this.collectLatestReply(agent, agent.session.snapshotEvents(start))
       const resultText = execution.result.kind === 'error'
         ? `命令执行失败：${execution.result.text}`
         : execution.result.text?.trim() || `命令 /${parsed.name} 已执行。`
@@ -341,16 +350,12 @@ export class ConversationManager {
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
-      const agentPreset = resolveSessionPreset({
-        header: inspected.meta,
-        events: inspected.events,
-      }) ?? this.resolveAgentPreset()
+      const agentPreset = await this.persistedAgentPreset(sessionId) ?? this.resolveAgentPreset()
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
-          setup: agentCtx => this.setupAgent(agentCtx, agentPreset),
+          setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset),
         }))
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId)
@@ -366,7 +371,7 @@ export class ConversationManager {
         sessionId,
         meta: { cwd: this.config.cwd, agentPreset },
         agentOptions,
-        setup: agentCtx => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset),
+        setup: (agentCtx, agent) => this.setupAgent(agentCtx, agent, agentPreset, this.config.permissionPreset),
       })
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
@@ -376,9 +381,20 @@ export class ConversationManager {
     this.persistedIds.add(id)
     handle.agent.inject(createUserMessage({
       content: [{ type: 'text', text: this.config.systemPrompt }],
-      source: { kind: 'plugin', plugin: 'deepseek-harness-weixin', form: 'instructions' },
+      source: { kind: 'deepseek-harness-weixin', form: 'instructions' },
     }))
     return this.ownAgent(handle)
+  }
+
+  /** Read the preset a stored session ran under without taking write ownership. */
+  private async persistedAgentPreset(sessionId: SessionId): Promise<string | undefined> {
+    const handle = await this.ctx.sessionPersistence.open(sessionId, 'read')
+    try {
+      const { events } = await handle.read()
+      return sessionAgentPreset(handle.header, events)
+    } finally {
+      await handle.close()
+    }
   }
 
   private ownAgent(handle: AgentHandle): ConversationAgentBinding {
@@ -393,13 +409,14 @@ export class ConversationManager {
     return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
   }
 
-  private async setupAgent(agentCtx: Context, agentPreset: string, permissionPreset?: string): Promise<void> {
+  private async setupAgent(
+    agentCtx: Context,
+    agent: Agent,
+    agentPreset: string,
+    permissionPreset?: string,
+  ): Promise<void> {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset)
-    if (permissionPreset !== undefined) {
-      const agent = agentCtx.agent
-      if (agent === undefined) throw new Error('weixin-channel: Agent setup context has no Agent')
-      this.ctx.permissionPresets.set(agent.session, permissionPreset)
-    }
+    if (permissionPreset !== undefined) this.ctx.permissionPresets.set(agent.session, permissionPreset)
   }
 
   private async collectReply(
@@ -499,4 +516,23 @@ export class ConversationManager {
       files: collected.files,
     }
   }
+}
+
+/**
+ * The preset a persisted session actually ran under.
+ *
+ * The header records the creation-time preset; a blank session may switch
+ * preset afterwards, and that switch is appended to the log. The newest
+ * logged selection therefore wins, matching the Agent preset registry's
+ * `agentPreset` session projection.
+ */
+function sessionAgentPreset(
+  header: SessionHeader,
+  events: readonly SessionEvent[],
+): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'agent-preset/selected') return event.data.agentPreset
+  }
+  return header.agentPreset
 }

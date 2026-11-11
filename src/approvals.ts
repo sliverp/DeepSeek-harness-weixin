@@ -131,7 +131,7 @@ export function formatApprovalPrompt(request: ApprovalRequest, code: string, tim
 function approvalDetail(request: ApprovalRequest): string {
   const call = request.callId === undefined
     ? undefined
-    : [...request.agent.session.events].reverse().find(event => event.type === 'tool/call'
+    : [...request.agent.session.snapshotEvents()].reverse().find(event => event.type === 'tool/call'
         && event.data.callId === request.callId)
   if (call?.type === 'tool/call') {
     try {

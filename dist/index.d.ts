@@ -288,6 +288,14 @@ interface OutboundFileCollection {
 /** Resolve final-answer file links into bounded bytes that can be uploaded by Weixin. */
 declare function collectOutboundFiles(text: string, cwd: string, maxFiles: number, maxFileBytes: number): Promise<OutboundFileCollection>;
 
+declare module '@deepseek-ai/dsh-llm' {
+    interface MessageSourceMap {
+        'deepseek-harness-weixin': {
+            kind: 'deepseek-harness-weixin';
+            form: 'instructions';
+        };
+    }
+}
 /** Completed response from one Weixin-triggered Harness turn. */
 interface ConversationReply {
     text: string;

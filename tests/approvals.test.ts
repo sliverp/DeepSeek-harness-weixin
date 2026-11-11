@@ -1,4 +1,4 @@
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import {
   formatApprovalPrompt,
@@ -7,7 +7,7 @@ import {
 } from '../src/approvals.js'
 
 function request(options: { command?: string; reason?: string; signal?: AbortSignal } = {}) {
-  const callId = CallId('call-approval')
+  const callId = ToolCallId('call-approval')
   const events = options.command === undefined
     ? []
     : [{
@@ -21,7 +21,7 @@ function request(options: { command?: string; reason?: string; signal?: AbortSig
         },
       }]
   return {
-    agent: { session: { events } },
+    agent: { session: { snapshotEvents: () => events } },
     toolName: 'bash',
     callId,
     ...(options.reason === undefined ? {} : { reason: options.reason }),

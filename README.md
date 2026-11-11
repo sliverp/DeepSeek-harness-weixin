@@ -29,7 +29,29 @@ The official ClawBot/iLink integration currently supports private chats only.
 
 - Node.js 22.19 or later
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.7 or later
+- DeepSeek Harness 0.2.2-rc.1 (desktop 0.2.2-rc.1)
+
+This release targets the 0.2.x plugin APIs. It resolves session presets through
+`@deepseek-ai/dsh-agent-preset-registry` and no longer imports the removed
+`resolveSessionPreset` helper from `@deepseek-ai/dsh-agent-presets`. Its
+`@deepseek-ai/dsh-credentials-local` runtime dependency and the matching
+Harness packages are pinned to `0.2.2-rc.1`, so installing it does not shadow
+the desktop app's built-in providers. No pnpm `overrides` or `shims` entry is
+required.
+
+pnpm may report the Harness core packages as missing peer dependencies during
+a profile install. That is expected: the desktop runtime supplies them, and
+hoisting a second copy into the profile is what would re-introduce the
+provider-shadowing failure.
+
+If you installed an earlier 0.1.x-compatible build, remove the old profile
+dependency first, then reinstall:
+
+```sh
+dsh plugin --profile web remove deepseek-harness-weixin
+rm -rf ~/.dsh/profiles/web/node_modules
+dsh plugin --profile web add github:sliverp/DeepSeek-harness-weixin
+```
 
 ## Prerequisite: ClawBot access
 
@@ -185,6 +207,8 @@ Run `dsh plugin --profile web exec dsh-weixin login --wait` to force a fresh sca
 pnpm install
 pnpm run check
 ```
+
+CI uses Node `22.19.0`.
 
 The repository pins pnpm `10.33.4`; pnpm 11 is not required.
 
